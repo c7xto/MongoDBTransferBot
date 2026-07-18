@@ -1,0 +1,9 @@
+pyrogram==2.0.106
+tgcrypto
+motor
+pymongo
+dnspython>=2.4,<2.8
+certifi
+aiohttp
+python-dotenv
+cryptography>=42.0,<46.0

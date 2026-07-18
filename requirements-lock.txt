@@ -1,0 +1,45 @@
+# requirements-lock.txt — full exact-pinned dependency snapshot
+#
+# This is NOT the file used for normal installs — use `requirements.txt`
+# (direct deps, range-pinned) or `requirements-dev.txt` (adds pytest) for
+# that. This file is a point-in-time `pip freeze` of every package actually
+# installed in the project venv (direct + transitive), kept for
+# reproducibility/debugging when a bug needs to be reproduced against an
+# exact known-good dependency set.
+#
+# requirements.txt intentionally does NOT pin certifi (CLAUDE.md §11:
+# "certifi must be kept current... do not pin to a specific version" — CA
+# bundle updates need to flow through freely to avoid silent TLS failures).
+# The exact certifi==... pin below is fine in this snapshot-only file, but
+# must never be back-ported into requirements.txt.
+#
+# Regenerate with:
+#   venv\Scripts\python.exe -m pip freeze > requirements-lock.txt
+#
+# Last generated: 2026-07-17
+
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.1
+aiosignal==1.4.0
+attrs==26.1.0
+certifi==2026.6.17
+colorama==0.4.6
+dnspython==2.7.0
+frozenlist==1.8.0
+idna==3.18
+iniconfig==2.3.0
+motor==3.7.1
+multidict==6.7.1
+packaging==26.2
+pluggy==1.6.0
+propcache==0.5.2
+pyaes==1.6.1
+Pygments==2.20.0
+pymongo==4.17.0
+Pyrogram==2.0.106
+PySocks==1.7.1
+pytest==8.4.2
+pytest-asyncio==0.24.0
+python-dotenv==1.2.2
+TgCrypto==1.2.5
+yarl==1.24.2
