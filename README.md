@@ -1,6 +1,6 @@
 <div align="center">
 
-![header](https://capsule-render.vercel.app/api?type=waving&color=0:8E2DE2,100:4A00E0&height=220&section=header&text=C7%20MongoDB%20Transfer%20Bot&fontSize=54&fontColor=ffffff&animation=fadeIn&fontAlignY=38&desc=V1.0%20%C2%B7%20Asynchronous%20Telegram%20Data%20Pipeline%20%C2%B7%20Multi-Tenant&descAlignY=58&descAlign=50)
+![header](https://capsule-render.vercel.app/api?type=waving&color=0:8E2DE2,100:4A00E0&height=220&section=header&text=C7%20MongoDB%20Transfer%20Bot&fontSize=54&fontColor=ffffff&animation=fadeIn&fontAlignY=38&desc=V2.0%20%C2%B7%20Asynchronous%20Telegram%20Data%20Pipeline%20%C2%B7%20Multi-Tenant&descAlignY=58&descAlign=50)
 
 <img src="https://readme-typing-svg.demolab.com?font=Fira+Code&weight=600&size=24&duration=2600&pause=800&color=8E2DE2&center=true&vCenter=true&width=720&lines=Asynchronous+Telegram+Data+Pipeline;Zero-copy+file_id+forwarding+at+scale;Adaptive+FloodWait+pacing+%C2%B7+Idempotent+delivery;Stateless+sessions+%E2%80%94+deploy+anywhere%2C+restart+fearlessly" alt="typing-svg" />
 
@@ -14,7 +14,7 @@
 ![Python](https://img.shields.io/badge/Python-3.10%20→%203.14-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![Architecture](https://img.shields.io/badge/Architecture-Multi--Tenant%20SaaS-ff69b4?style=for-the-badge)
 ![License](https://img.shields.io/badge/State-Production-orange?style=for-the-badge)
-![Version](https://img.shields.io/badge/Version-V1.0-8E2DE2?style=for-the-badge)
+![Version](https://img.shields.io/badge/Version-V2.0-8E2DE2?style=for-the-badge)
 
 </div>
 
@@ -22,7 +22,7 @@
 
 ## ⚡ Overview
 
-**C7 MongoDB Transfer Bot V1.0** (internally, the C7 Data Engine) is a fully asynchronous, multi-tenant data pipeline that streams media catalogs from **MongoDB Atlas** into **Telegram channels** — at scale, with exactly-once delivery semantics, and without ever touching raw file bytes.
+**C7 MongoDB Transfer Bot V2.0** (internally, the C7 Data Engine) is a fully asynchronous, multi-tenant data pipeline that streams media catalogs from **MongoDB Atlas** into **Telegram channels** without touching raw file bytes.
 
 The engine operates purely on Telegram `file_id` references: no downloads, no re-uploads, no disk I/O on the data path. A single deployed instance serves unlimited isolated tenants, each with their own credentials, database, worker bot, and transfer state — orchestrated over one shared asyncio event loop.
 
@@ -88,8 +88,8 @@ Every send path is wrapped in `FloodWait`-aware handling: the exact server-manda
 ### ☁️ Stateless Session Architecture
 Every Pyrogram client runs with `in_memory=True` — **zero `.session` files touch disk**. Bot workers re-authenticate from tokens; the pre-scan userbot persists its session as a **Fernet-encrypted string** in MongoDB (`ENCRYPTION_KEY` env var — see setup below), so a leaked or compromised Master DB does not hand over a live Telegram account login. The result: the engine is fully stateless at the filesystem level, making it trivially deployable on ephemeral containers (Optiklink / Pterodactyl / any read-only-root host) and immune to session-file corruption on hard restarts.
 
-### 🔁 Exactly-Once Delivery
-A unique-indexed `c7_sent_ids` ledger plus a channel-history `c7_scan_index` guarantee no file is ever delivered twice — even across crashes, restarts, and manual re-runs. Dedup checks are **fully batched**: a single `$in` query per ledger clears an entire 1000-document fetch in one database round-trip, instead of two queries per file — collapsing thousands of Atlas round-trips per batch into two. The resume cursor checkpoints to `c7_state` every 10 batches; on boot, interrupted transfers trigger an **interactive Continue / Start-Fresh prompt** instead of blind auto-resume.
+### 🔁 Idempotent Delivery
+A unique-indexed `c7_sent_ids` ledger plus a channel-history `c7_scan_index` make delivery idempotent across crashes, restarts, and manual re-runs. Dedup checks are **fully batched**: a single `$in` query per ledger clears an entire 1000-document fetch in one database round-trip, instead of two queries per file. Transfer progress and live-monitor resume tokens are stored in a host-owned runtime database, so the source catalogue can use a read-only MongoDB account. On boot, interrupted transfers trigger an interactive Continue / Start-Fresh prompt instead of blind auto-resume.
 
 ### 🛡️ SSRF-Hardened Multi-Tenancy
 Every tenant-supplied MongoDB URI is X-rayed before a single socket opens: scheme whitelist, private/loopback/link-local IP rejection, real SRV-target resolution for `+srv` clusters, and stripping of dangerous driver options (`proxyHost`, `tlsInsecure`, pool overrides). Credentials are regex-redacted from every log line — Motor exceptions included.
@@ -163,12 +163,20 @@ TELEGRAM_API_ID=your_api_id
 TELEGRAM_API_HASH=your_api_hash
 MONGO_URI=your_master_mongodb_uri
 ADMIN_ID=your_telegram_user_id        # optional
+STATE_MONGO_URI=your_runtime_mongodb_uri # optional; defaults to MONGO_URI
+STATE_DB_PREFIX=c7_runtime               # optional
 ENCRYPTION_KEY=your_fernet_key         # required only for /prescan — encrypts the
                                        # userbot session at rest (see below)
 
 # 4. Launch
 python mdb.py
 ```
+
+The MongoDB URI entered in `/setup` is treated as a **read-only source
+catalogue**. Mutable transfer ledgers, scan indexes, cursors, and live-monitor
+resume tokens are written to the host-owned `STATE_MONGO_URI` instead. The
+source documents may store Telegram IDs either as `_id` (legacy auto-filter
+bots) or in a dedicated `file_id` field.
 
 Then DM your bot `/start` on Telegram — the wizard handles everything else.
 

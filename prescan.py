@@ -3,15 +3,22 @@ prescan.py — channel pre-scan (userbot session from user config or prompted)
 Multi-user mode: accepts user_cfg dict and a Motor db handle.
 """
 from __future__ import annotations
+
 import asyncio
+
 from pyrogram import Client
 from pyrogram.errors import SessionPasswordNeeded
+
 import config as cfg
 import crypto
 import target_resolve
+from source_docs import SOURCE_PROJECTION, get_file_id, get_match_keys
 from user_db import (
-    index_channel_key, get_channel_index_count,
-    filter_in_channel_index, mark_as_sent, count_sent_ids,
+    count_sent_ids,
+    filter_in_channel_index,
+    get_channel_index_count,
+    index_channel_key,
+    mark_as_sent,
 )
 
 L = cfg.logger
@@ -20,7 +27,8 @@ L = cfg.logger
 async def run_prescan(
         admin_app: Client,
         user_cfg:  dict,
-        user_db,              # AsyncIOMotorDatabase for the user's cluster
+        source_db,
+        state_db=None,
 ) -> None:
     """
     Pre-scan the user's target channel to build a duplicate index.
@@ -29,6 +37,8 @@ async def run_prescan(
     """
     user_id  = user_cfg["_id"]
     admin_id = user_id
+    if state_db is None:
+        state_db = source_db
 
     L.info(f"[SCAN] Pre-scan started  user={user_id}")
 
@@ -123,8 +133,8 @@ async def run_prescan(
 
                     await admin_app.send_message(
                         admin_id,
-                        f"✅ **Logged in!** Session saved to your profile.\n\n"
-                        f"Starting scan…")
+                        "✅ **Logged in!** Session saved to your profile.\n\n"
+                        "Starting scan…")
             finally:
                 await tmp.disconnect()
                 if not auth_ok:
@@ -168,14 +178,13 @@ async def run_prescan(
                     L.info(f"[SCAN] Step 1/3 progress  messages={msg_count:,}  "
                            f"keys={len(channel_keys):,}  user={user_id}")
 
-            await index_channel_key(user_db, list(channel_keys))
-            total_indexed = await get_channel_index_count(user_db)
+            await index_channel_key(state_db, list(channel_keys))
+            total_indexed = await get_channel_index_count(state_db)
             L.info(f"[SCAN] Step 1/3 done  messages={msg_count:,}  "
                    f"keys_indexed={total_indexed:,}  user={user_id}")
 
             # ── Step 2: Cross-reference with MongoDB ───────────────────────────
-            # user_db already points at the same database — reuse it.
-            col = user_db[user_cfg["col_name"]]
+            col = source_db[user_cfg["col_name"]]
             total_docs = await col.count_documents({})
 
             L.info(f"[SCAN] Step 2/3 — cross-referencing MongoDB  "
@@ -195,18 +204,13 @@ async def run_prescan(
                 if not buf:
                     return
                 keys_by_file = {
-                    str(d["_id"]): [
-                        str(d["_id"]),
-                        (d.get("file_name") or "").lower().strip(),
-                        (d.get("caption")   or "").lower().strip(),
-                    ]
-                    for d in buf
+                    get_file_id(d): get_match_keys(d)
+                    for d in buf if get_file_id(d)
                 }
-                hits = await filter_in_channel_index(user_db, keys_by_file)
+                hits = await filter_in_channel_index(state_db, keys_by_file)
                 matched.extend(hits)
 
-            async for doc in col.find(
-                    {}, {"_id": 1, "file_name": 1, "caption": 1}).sort("_id", 1):
+            async for doc in col.find({}, SOURCE_PROJECTION).sort("_id", 1):
                 doc_buffer.append(doc)
                 checked += 1
 
@@ -215,7 +219,7 @@ async def run_prescan(
                     doc_buffer = []
 
                 if len(matched) >= 500:
-                    await mark_as_sent(user_db, matched)
+                    await mark_as_sent(state_db, matched)
                     matched = []
 
                 if checked % 2000 == 0:
@@ -224,10 +228,10 @@ async def run_prescan(
 
             await _flush_buffer(doc_buffer)
             if matched:
-                await mark_as_sent(user_db, matched)
+                await mark_as_sent(state_db, matched)
 
             # ── Step 3: Summary ───────────────────────────────────────────────
-            skippable = await count_sent_ids(user_db)
+            skippable = await count_sent_ids(state_db)
             fresh     = max(0, total_docs - skippable)
 
             L.info(f"[SCAN] Pre-scan complete  skip={skippable:,}  "

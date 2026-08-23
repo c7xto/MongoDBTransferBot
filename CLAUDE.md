@@ -89,18 +89,27 @@ Two categories of MongoDB connection exist. They must never be mixed.
 - Accessible via: `db.py` functions only (`get_user`, `update_user_field`, etc.)
 - **Never** used to store per-user transfer state or dedup data
 
-### Per-user DB — tenant data only
+### Per-user source DB — read-only catalogue
 
 - URI source: `user_cfg["mongo_uri"]` (user-supplied, stored in Master DB)
 - Database: `user_cfg["db_name"]`
-- Collections: `c7_sent_ids`, `c7_scan_index`, `c7_state`, and the user's source
-  data collection (`user_cfg["col_name"]`)
-- Purpose: deduplication tracking, transfer cursor, and source file documents
-- Accessible via: `user_db.py` functions and `user_db[col_name]` for source data
+- Collections: the user's source data collection (`user_cfg["col_name"]`)
+- Purpose: read source file documents only
+- Accessible via: `get_user_motor_db(...)` and `source_db[col_name]`
 - **Never** used for host-level configuration or cross-tenant queries
 
-**There must be zero code paths that write tenant data to the Master DB or read
-Master DB config from a user's URI.**
+### Host-owned runtime state DB — mutable transfer data
+
+- URI source: optional `STATE_MONGO_URI`, defaulting to the host-owned
+  `MASTER_MONGO_URI`
+- Database: isolated `STATE_DB_PREFIX_<telegram_user_id>` database per tenant
+- Collections: `c7_sent_ids`, `c7_scan_index`, and `c7_state`
+- Purpose: deduplication, pre-scan index, transfer cursor, and monitor resume token
+- Accessible through `get_user_state_db(user_id)` and `user_db.py` helpers
+- This separation is required so a friend's source account can remain read-only
+
+**There must be zero code paths that write runtime state into a tenant's source
+database or read host configuration from a user's URI.**
 
 ---
 

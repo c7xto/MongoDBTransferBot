@@ -12,7 +12,9 @@ Key handling:
     raised from this module — only the fact that it's missing/invalid.
 """
 from __future__ import annotations
+
 import os
+
 from cryptography.fernet import Fernet, InvalidToken
 
 _fernet: Fernet | None = None

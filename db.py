@@ -4,16 +4,34 @@ Stores and retrieves per-user configuration in the host's Atlas cluster.
 All per-user dedup/state helpers live in user_db.py instead.
 """
 from __future__ import annotations
-import asyncio, certifi, datetime, ipaddress, socket, time
+
+import asyncio
+import datetime
+import ipaddress
+import socket
+import time
 from dataclasses import dataclass, field
-from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+import certifi
 import dns.asyncresolver
 import dns.exception
 import motor.motor_asyncio
+
 from config import (
-    MASTER_MONGO_URI, HOST_ADMIN_ID, logger, active_tasks,
-    _LEGACY_DB_NAME, _LEGACY_COL_NAME, _LEGACY_TARGET,
-    _LEGACY_SPEED, PARENT_BOT_TOKEN, HOST_API_ID, HOST_API_HASH,
+    _LEGACY_COL_NAME,
+    _LEGACY_DB_NAME,
+    _LEGACY_SPEED,
+    _LEGACY_TARGET,
+    HOST_ADMIN_ID,
+    HOST_API_HASH,
+    HOST_API_ID,
+    MASTER_MONGO_URI,
+    PARENT_BOT_TOKEN,
+    STATE_DB_PREFIX,
+    STATE_MONGO_URI,
+    active_tasks,
+    logger,
 )
 
 # ── Master client (singleton) ─────────────────────────────────────────────────
@@ -102,6 +120,19 @@ async def get_user_motor_db(
     return entry.client[db_name]
 
 
+async def get_user_state_db(user_id: int):
+    """Return the host-owned, per-user runtime-state database.
+
+    Keeping this separate from the source catalogue allows its MongoDB account
+    to be strictly read-only while checkpoints and dedup ledgers remain writable.
+    """
+    return await get_user_motor_db(
+        STATE_MONGO_URI,
+        f"{STATE_DB_PREFIX}_{int(user_id)}",
+        user_id=user_id,
+    )
+
+
 def evict_idle_user_motor_clients(now: float | None = None) -> int:
     """
     Close and drop every cached client idle longer than the TTL — unless one
@@ -119,7 +150,10 @@ def evict_idle_user_motor_clients(now: float | None = None) -> int:
     for uri, entry in _user_motor_clients.items():
         if now - entry.last_used <= _USER_CLIENT_IDLE_TTL_SECONDS:
             continue
-        if any(uid in active_tasks for uid in entry.user_ids):
+        if any(
+            any(key.endswith(f":{uid}") for key in active_tasks)
+            for uid in entry.user_ids
+        ):
             continue
         stale_uris.append(uri)
     for uri in stale_uris:

@@ -5,20 +5,34 @@ Includes live progress card editing (throttled to every 15 s) and
 a pause gate that sleeps the loop without blocking the event loop.
 """
 from __future__ import annotations
-import asyncio, io, time, random
+
+import asyncio
+import io
+import random
+import time
+
 from bson import ObjectId
 from pyrogram import Client
-from pyrogram.errors import FloodWait, AuthKeyDuplicated
+from pyrogram.errors import AuthKeyDuplicated, FloodWait
 from pyrogram.types import (
-    InputMediaDocument, InputMediaVideo, InputMediaPhoto, InputMediaAudio,
+    InputMediaAudio,
+    InputMediaDocument,
+    InputMediaPhoto,
+    InputMediaVideo,
 )
+
 import config as cfg
-import ui
 import target_resolve
+import ui
+from source_docs import SOURCE_PROJECTION, get_file_id, get_match_keys
 from user_db import (
-    load_state, save_state, clear_state,
-    filter_already_sent, mark_as_sent, filter_in_channel_index,
-    get_stats, count_sent_ids,
+    clear_state,
+    count_sent_ids,
+    filter_already_sent,
+    filter_in_channel_index,
+    load_state,
+    mark_as_sent,
+    save_state,
 )
 
 L = cfg.logger
@@ -50,14 +64,16 @@ def _is_video(doc: dict) -> bool:
 
 def _make_media_item(doc: dict):
     cap = f"<code>{doc.get('caption') or doc.get('file_name', 'No Title')}</code>"
-    fid = str(doc["_id"])
+    fid = get_file_id(doc)
+    if not fid:
+        raise ValueError("Source document has no Telegram file_id")
     if fid.startswith("BQAD"):
-        return InputMediaDocument(media=doc["_id"], caption=cap)
+        return InputMediaDocument(media=fid, caption=cap)
     if fid.startswith("AgAD"):
-        return InputMediaPhoto(media=doc["_id"], caption=cap)
+        return InputMediaPhoto(media=fid, caption=cap)
     if fid.startswith("CQAD"):
-        return InputMediaAudio(media=doc["_id"], caption=cap)
-    return InputMediaVideo(media=doc["_id"], caption=cap)
+        return InputMediaAudio(media=fid, caption=cap)
+    return InputMediaVideo(media=fid, caption=cap)
 
 
 async def _send_single(worker: Client, target_id: int, doc: dict) -> None:
@@ -72,7 +88,9 @@ async def _send_single(worker: Client, target_id: int, doc: dict) -> None:
     to the next attempt and spamming Telegram while still rate-limited.
     """
     cap  = f"<code>{doc.get('caption') or doc.get('file_name', 'No Title')}</code>"
-    fid  = doc["_id"]
+    fid  = get_file_id(doc)
+    if not fid:
+        raise ValueError("Source document has no Telegram file_id")
     is_v = _is_video(doc)
 
     try:
@@ -218,16 +236,16 @@ async def run_transfer(
         worker:     Client,
         admin_app:  Client,
         user_cfg:   dict,
-        user_db,
+        source_db,
+        state_db=None,
 ) -> None:
     """
     Main transfer engine.
     user_cfg keys used: mongo_uri, db_name, col_name, target, speed_delay, _id.
-    user_db is a Motor database handle pointing at user_cfg["db_name"].
+    ``source_db`` is read-only catalogue access. ``state_db`` stores mutable
+    checkpoints and deduplication; it defaults to source_db for compatibility.
     """
     user_id    = user_cfg["_id"]
-    mongo_uri  = user_cfg["mongo_uri"]
-    db_name    = user_cfg["db_name"]
     col_name   = user_cfg["col_name"]
     admin_id   = user_id
     speed_cfg  = float(user_cfg.get("speed_delay", 3.5))
@@ -246,6 +264,8 @@ async def run_transfer(
     # Initialise to safe defaults so finally-block can always reference them
     count = 0
     total = 0
+    if state_db is None:
+        state_db = source_db
 
     L.info(f"[XFER] Transfer started  user={user_id}  speed={current_speed}s")
 
@@ -260,25 +280,37 @@ async def run_transfer(
         L.info(f"[XFER] Pre-flight passed  target={target_id}  user={user_id}")
 
         # ── Connect to user's source data collection ──────────────────────────
-        # user_db is already connected to db_name — reuse its client rather than
+        # source_db is already connected to db_name — reuse its client rather than
         # opening a second connection pool just for the source collection.
-        col = user_db[col_name]
+        col = source_db[col_name]
 
-        state  = await load_state(user_db)
-        total  = await col.count_documents({})
-        count  = await count_sent_ids(user_db)
+        state = await load_state(state_db)
+        total = await col.count_documents({})
+        sent_before = await count_sent_ids(state_db)
+
+        # Keyset pagination is safe only for naturally ordered identifiers.
+        # Many auto-filter databases put a Telegram file_id string in `_id`;
+        # a newly inserted string can sort before the saved cursor and would
+        # then be missed forever. Such schemas use restart-safe offset scans,
+        # with the persistent sent ledger providing idempotency.
+        sample = await col.find_one({}, {"_id": 1})
+        sample_id = sample.get("_id") if sample else None
+        cursor_mode = "keyset" if isinstance(sample_id, (ObjectId, int)) else "offset"
+        if state.get("mode") not in (None, cursor_mode):
+            state = {"last_id": None, "offset": 0}
 
         raw_last_id = state.get("last_id")
-        last_id = None
-        if raw_last_id:
-            sample = await col.find_one({}, {"_id": 1})
-            if sample:
-                last_id = _cast_last_id(raw_last_id, sample["_id"])
-            else:
-                last_id = raw_last_id
+        last_id = (_cast_last_id(raw_last_id, sample_id)
+                   if cursor_mode == "keyset" and raw_last_id else None)
+        scan_offset = max(0, int(state.get("offset") or 0)) if cursor_mode == "offset" else 0
+        if cursor_mode == "keyset" and last_id is not None:
+            count = await col.count_documents({"_id": {"$lte": last_id}})
+        else:
+            count = min(scan_offset, total)
 
         L.info(f"[XFER] Collection loaded  total={total:,}  "
-               f"already_sent={count:,}  resumed_from={last_id}  user={user_id}")
+               f"already_sent={sent_before:,}  mode={cursor_mode}  "
+               f"resumed_from={last_id if cursor_mode == 'keyset' else scan_offset}  user={user_id}")
 
         # Push initial snapshot so the card shows real totals immediately
         elapsed_now = time.time() - transfer_start
@@ -297,16 +329,18 @@ async def run_transfer(
         speed  = current_speed
 
         while keep and count < total:
-            qf = {"_id": {"$gt": last_id}} if last_id else {}
+            qf = ({"_id": {"$gt": last_id}}
+                  if cursor_mode == "keyset" and last_id is not None else {})
 
             # ── Resilient batch fetch ────────────────────────────────────────
             fetch_attempt = 0
             batch = None
             while True:
                 try:
-                    batch = await col.find(
-                        qf, {"_id": 1, "caption": 1, "file_name": 1, "mime_type": 1}
-                    ).sort("_id", 1).limit(BATCH).to_list(length=BATCH)
+                    cursor = col.find(qf, SOURCE_PROJECTION).sort("_id", 1)
+                    if cursor_mode == "offset":
+                        cursor = cursor.skip(scan_offset)
+                    batch = await cursor.limit(BATCH).to_list(length=BATCH)
                     break  # success
                 except Exception as conn_err:
                     fetch_attempt += 1
@@ -320,7 +354,7 @@ async def run_transfer(
                         f"[CONN] Connection lost (attempt {fetch_attempt}/{_CONN_MAX_RETRIES}) — "
                         f"pausing {_CONN_RETRY_WAIT}s to reconnect…  err={conn_err}  user={user_id}")
                     await asyncio.sleep(_CONN_RETRY_WAIT)
-                    col = user_db[col_name]  # Motor reconnects automatically on next use
+                    col = source_db[col_name]  # Motor reconnects automatically on next use
                     await _ensure_worker_connected(worker, user_id)
 
             if not keep or not batch:
@@ -330,24 +364,39 @@ async def run_transfer(
             # (up to 1000 docs) instead of up to two find_one round-trips per
             # document — this is the difference between ~2 DB calls and ~2000
             # DB calls per batch at scale.
-            batch_file_ids   = [str(doc["_id"]) for doc in batch]
-            already_sent_set = await filter_already_sent(user_db, batch_file_ids)
+            valid_batch = [doc for doc in batch if get_file_id(doc)]
+            invalid_count = len(batch) - len(valid_batch)
+            if invalid_count:
+                L.warning(f"[XFER] Skipping {invalid_count} source document(s) without file_id  user={user_id}")
+                count += invalid_count
+            if not valid_batch:
+                if cursor_mode == "offset":
+                    scan_offset += len(batch)
+                else:
+                    last_id = batch[-1]["_id"]
+                await save_state(
+                    state_db,
+                    last_id if cursor_mode == "keyset" else None,
+                    offset=scan_offset,
+                    mode=cursor_mode,
+                )
+                continue
+            batch_file_ids = [get_file_id(doc) for doc in valid_batch]
+            already_sent_set = await filter_already_sent(state_db, batch_file_ids)
 
             keys_by_file = {}
-            for doc in batch:
-                fid = str(doc["_id"])
+            for doc in valid_batch:
+                fid = get_file_id(doc)
                 if fid in already_sent_set:
                     continue
-                fname = (doc.get("file_name") or "").lower().strip()
-                fcap  = (doc.get("caption")   or "").lower().strip()
-                keys_by_file[fid] = [fid, fname, fcap]
+                keys_by_file[fid] = get_match_keys(doc)
 
-            in_index_set = await filter_in_channel_index(user_db, keys_by_file)
+            in_index_set = await filter_in_channel_index(state_db, keys_by_file)
             if in_index_set:
-                await mark_as_sent(user_db, list(in_index_set))
+                await mark_as_sent(state_db, list(in_index_set))
 
-            for i in range(0, len(batch), ALBUM):
-                chunk = batch[i:i + ALBUM]
+            for i in range(0, len(valid_batch), ALBUM):
+                chunk = valid_batch[i:i + ALBUM]
 
                 # ── Pause gate ────────────────────────────────────────────────
                 while cfg.paused_transfers.get(user_id):
@@ -371,9 +420,9 @@ async def run_transfer(
                 fresh       = []
                 skipped_ids = []
                 for doc in chunk:
-                    fid = str(doc["_id"])
+                    fid = get_file_id(doc)
                     if fid in already_sent_set or fid in in_index_set:
-                        skipped_ids.append(doc["_id"])
+                        skipped_ids.append(fid)
                         continue
                     fresh.append(doc)
 
@@ -383,7 +432,7 @@ async def run_transfer(
 
                 if not fresh:
                     count   += skipped
-                    last_id  = chunk[-1]["_id"]
+                    last_id = chunk[-1]["_id"]
                     chunks  += 1
                 else:
                     chunk      = fresh
@@ -391,7 +440,7 @@ async def run_transfer(
 
                     try:
                         await worker.send_media_group(chat_id=target_id, media=media_group)
-                        await mark_as_sent(user_db, [d["_id"] for d in chunk])
+                        await mark_as_sent(state_db, [get_file_id(d) for d in chunk])
                         count  += len(chunk) + skipped
                         last_id = chunk[-1]["_id"]
 
@@ -402,8 +451,8 @@ async def run_transfer(
                                    f"{current_speed}s  user={user_id}")
                         await asyncio.sleep(fw.value + 5)
 
-                        first_fid    = str(chunk[0]["_id"])
-                        already_sent = bool(await filter_already_sent(user_db, [first_fid]))
+                        first_fid = get_file_id(chunk[0])
+                        already_sent = bool(await filter_already_sent(state_db, [first_fid]))
                         if already_sent:
                             L.info(f"[XFER] FloodWait retry skipped — original send succeeded  user={user_id}")
                             count  += len(chunk) + skipped
@@ -411,13 +460,13 @@ async def run_transfer(
                         else:
                             try:
                                 await worker.send_media_group(chat_id=target_id, media=media_group)
-                                await mark_as_sent(user_db, [d["_id"] for d in chunk])
+                                await mark_as_sent(state_db, [get_file_id(d) for d in chunk])
                                 count  += len(chunk) + skipped
                                 last_id = chunk[-1]["_id"]
                                 L.info(f"[XFER] FloodWait retry succeeded  user={user_id}")
                             except Exception as re:
                                 for doc in chunk:
-                                    failed_files.append(f"ID: {doc['_id']} | {re}")
+                                    failed_files.append(f"ID: {get_file_id(doc)} | {re}")
                                 count  += len(chunk) + skipped
                                 last_id = chunk[-1]["_id"]
                                 L.error(f"[XFER] FloodWait retry failed  err={re}  user={user_id}")
@@ -438,7 +487,7 @@ async def run_transfer(
                             await _refresh_worker_session(worker, user_id)
                             try:
                                 await worker.send_media_group(chat_id=target_id, media=media_group)
-                                await mark_as_sent(user_db, [d["_id"] for d in chunk])
+                                await mark_as_sent(state_db, [get_file_id(d) for d in chunk])
                                 count  += len(chunk) + skipped
                                 last_id = chunk[-1]["_id"]
                                 L.info(f"[CONN] Post-refresh retry succeeded  user={user_id}")
@@ -454,10 +503,10 @@ async def run_transfer(
                             for doc in chunk:
                                 try:
                                     await _send_single(worker, target_id, doc)
-                                    await mark_as_sent(user_db, [doc["_id"]])
+                                    await mark_as_sent(state_db, [get_file_id(doc)])
                                 except Exception as sub_e:
-                                    failed_files.append(f"ID: {doc['_id']} | {sub_e}")
-                                    L.error(f"[XFER] Individual send failed  id={doc['_id']}  "
+                                    failed_files.append(f"ID: {get_file_id(doc)} | {sub_e}")
+                                    L.error(f"[XFER] Individual send failed  id={get_file_id(doc)}  "
                                             f"err={sub_e}  user={user_id}")
                                 count  += 1
                                 last_id = doc["_id"]
@@ -485,9 +534,19 @@ async def run_transfer(
                         f"[XFER] [{_bar}] {pct:.0f}% │ {_k(count)}/{_k(total)} │ "
                         f"ETA: {_eta} │ Spd: {speed:.1f}s/file  user={user_id}")
 
+                if cursor_mode == "offset":
+                    # Offset advances by source documents, including malformed
+                    # rows, so a bad row cannot trap the scan in a loop.
+                    scan_offset += len(batch) if i + ALBUM >= len(valid_batch) else 0
+
                 # ── Persist resume cursor every 10 chunks ─────────────────────
                 if chunks % 10 == 0:
-                    await save_state(user_db, last_id)
+                    await save_state(
+                        state_db,
+                        last_id if cursor_mode == "keyset" else None,
+                        offset=scan_offset,
+                        mode=cursor_mode,
+                    )
 
                 # ── Live progress snapshot (for callback handlers) ─────────────
                 now_t       = time.time()
@@ -519,14 +578,18 @@ async def run_transfer(
                     await asyncio.sleep(break_secs)
 
         # ── Save final cursor ────────────────────────────────────────────────
-        if last_id:
-            await save_state(user_db, last_id)
+        await save_state(
+            state_db,
+            last_id if cursor_mode == "keyset" else None,
+            offset=scan_offset,
+            mode=cursor_mode,
+        )
 
         elapsed_final = time.time() - transfer_start
 
         # ── Transfer completed naturally ──────────────────────────────────────
         if cfg.active_transfers.get(user_id) and count >= total:
-            await clear_state(user_db)
+            await clear_state(state_db)
             L.info(f"[XFER] Transfer complete  sent={count:,}  "
                    f"failed={len(failed_files)}  elapsed={elapsed_final:.0f}s  user={user_id}")
             await _edit_card(admin_app, admin_id, user_id,

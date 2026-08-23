@@ -4,9 +4,15 @@ Multi-user mode: only host credentials live here.
 Per-user credentials are stored in Master MongoDB.
 """
 from __future__ import annotations
-import sys, os, logging, asyncio, re
+
+import asyncio
+import logging
+import os
+import re
+import sys
 
 import pyrogram.utils
+
 # Overwrite Pyrogram's legacy limits to support newer 2024-2026 Telegram IDs
 pyrogram.utils.MIN_CHAT_ID = -999999999999
 pyrogram.utils.MIN_CHANNEL_ID = -100999999999999
@@ -165,6 +171,13 @@ HOST_API_HASH     = _req("TELEGRAM_API_HASH")
 # Master MongoDB — stores all user configs (c7_users collection)
 MASTER_MONGO_URI  = _req("MONGO_URI")           # host's Atlas cluster
 
+# Transfer checkpoints and deduplication must never require write access to a
+# friend's source catalogue. By default they live beside the master config but
+# in isolated per-user databases. Hosts may point STATE_MONGO_URI at a separate
+# owned cluster without changing tenant configuration.
+STATE_MONGO_URI    = _opt("STATE_MONGO_URI", MASTER_MONGO_URI)
+STATE_DB_PREFIX    = _opt("STATE_DB_PREFIX", "c7_runtime")
+
 # Optional: host admin Telegram ID (can bootstrap first user from .env)
 HOST_ADMIN_ID     = int(_opt("ADMIN_ID", "0")) or None
 
@@ -207,7 +220,7 @@ transfer_progress:  dict[int, dict]   = {}
 # Tracked asyncio.Task objects for every background launch (transfer/monitor/
 # prescan), keyed by user_id. Populated by mdb.py's _track_task() so crashes
 # are logged and shutdown can cancel + await every in-flight task.
-active_tasks:        dict[int, asyncio.Task]  = {}
+active_tasks:        dict[str, asyncio.Task]  = {}
 
 # Reserved negative sentinel key for system-level (non-per-user) background
 # tasks tracked in active_tasks. Telegram user_ids are always positive, so a

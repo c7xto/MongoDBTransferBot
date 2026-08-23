@@ -12,6 +12,9 @@ Usage:
     await init_user_db(db)
 """
 from __future__ import annotations
+
+import asyncio
+
 from config import logger
 
 
@@ -34,18 +37,45 @@ async def load_state(db) -> dict:
     return doc if doc else {"last_id": None}
 
 
-async def save_state(db, last_id) -> None:
+async def save_state(db, last_id=None, *, offset: int | None = None,
+                     mode: str | None = None) -> None:
+    values = {"last_id": str(last_id) if last_id is not None else None}
+    if offset is not None:
+        values["offset"] = max(0, int(offset))
+    if mode is not None:
+        values["mode"] = mode
     await _col_state(db).update_one(
         {"_id": "transfer_state"},
-        {"$set": {"last_id": str(last_id) if last_id else None}},
+        {"$set": values},
         upsert=True)
 
 
 async def clear_state(db) -> None:
     await _col_state(db).update_one(
         {"_id": "transfer_state"},
-        {"$set": {"last_id": None}},
+        {"$set": {"last_id": None, "offset": 0, "mode": None}},
         upsert=True)
+
+
+async def load_monitor_resume_token(db):
+    """Load the last durably processed MongoDB change-stream token."""
+    doc = await _col_state(db).find_one(
+        {"_id": "monitor_state"}, {"resume_token": 1})
+    return doc.get("resume_token") if doc else None
+
+
+async def save_monitor_resume_token(db, token) -> None:
+    """Checkpoint only after the corresponding Telegram send is recorded."""
+    if token is None:
+        return
+    await _col_state(db).update_one(
+        {"_id": "monitor_state"},
+        {"$set": {"resume_token": token}},
+        upsert=True)
+
+
+async def clear_monitor_resume_token(db) -> None:
+    await _col_state(db).delete_one({"_id": "monitor_state"})
 
 
 # ── Dedup helpers ─────────────────────────────────────────────────────────────
@@ -63,24 +93,33 @@ async def filter_already_sent(db, file_ids: list) -> set:
     return {doc["file_id"] async for doc in cursor}
 
 
-async def mark_as_sent(db, file_ids: list) -> None:
+async def mark_as_sent(db, file_ids: list, *, attempts: int = 3) -> bool:
     if not file_ids:
-        return
-    try:
-        await _col_sent_ids(db).insert_many(
-            [{"file_id": str(fid)} for fid in file_ids],
-            ordered=False)
-    except Exception as e:
-        bulk_ok = False
+        return True
+    attempts = max(1, int(attempts))
+    for attempt in range(1, attempts + 1):
         try:
-            from pymongo.errors import BulkWriteError
-            if isinstance(e, BulkWriteError):
-                codes = {err.get("code") for err in e.details.get("writeErrors", [])}
-                bulk_ok = codes <= {11000}
-        except ImportError:
-            pass
-        if not bulk_ok:
-            logger.error(f"[DB] mark_as_sent write failed  err={e}")
+            await _col_sent_ids(db).insert_many(
+                [{"file_id": str(fid)} for fid in file_ids],
+                ordered=False)
+            return True
+        except Exception as e:
+            bulk_ok = False
+            try:
+                from pymongo.errors import BulkWriteError
+                if isinstance(e, BulkWriteError):
+                    codes = {err.get("code") for err in e.details.get("writeErrors", [])}
+                    bulk_ok = codes <= {11000}
+            except ImportError:
+                pass
+            if bulk_ok:
+                return True
+            if attempt == attempts:
+                logger.error(
+                    f"[DB] mark_as_sent failed after {attempts} attempt(s)  err={e}")
+                return False
+            await asyncio.sleep(2 ** (attempt - 1))
+    return False
 
 
 async def clear_sent_ids(db) -> None:
@@ -142,12 +181,12 @@ async def count_sent_ids(db) -> int:
 
 
 # ── Stats ─────────────────────────────────────────────────────────────────────
-async def get_stats(db, col_name: str) -> dict:
+async def get_stats(db, col_name: str, *, source_db=None) -> dict:
     """
     Return transfer progress stats.
     `col_name` is the user's source data collection name.
     """
-    data_col = db[col_name]
+    data_col = (source_db if source_db is not None else db)[col_name]
     total = await data_col.count_documents({})
     sent  = await _col_sent_ids(db).count_documents({})
     state = await load_state(db)

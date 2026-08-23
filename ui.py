@@ -2,9 +2,12 @@
 ui.py — inline keyboard builders + live progress card renderer
 """
 from __future__ import annotations
+
 import math
 from enum import Enum
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+
 import config as cfg
 
 
@@ -117,7 +120,7 @@ def build_progress_card(
 
 def home_card_text(stats: dict, user_id: int) -> str:
     return (
-        f"⚡ **C7 MongoDB Transfer Bot V1.0**\n`{cfg.SEP}`\n"
+        f"⚡ **C7 MongoDB Transfer Bot V2.0**\n`{cfg.SEP}`\n"
         f"📦 Total files › `{stats['total_files']:,}`\n"
         f"✅ Sent › `{stats['sent_files']:,}`\n"
         f"⏳ Remaining › `{stats['remaining']:,}`\n"

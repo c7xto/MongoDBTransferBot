@@ -5,7 +5,9 @@ resolves user_cfg["target"] (invite link / @username / numeric ID) via a live
 Pyrogram worker client.
 """
 from __future__ import annotations
+
 from pyrogram import Client
+
 import config as cfg
 
 L = cfg.logger
@@ -43,8 +45,10 @@ async def resolve_target_chat_id(
                 except Exception:
                     raise RuntimeError(
                         f"Cannot access channel. Banned or invalid link.\n`{join_err}`")
-        try:    return (await worker.join_chat(invite)).id
-        except: return (await worker.get_chat(invite)).id
+        try:
+            return (await worker.join_chat(invite)).id
+        except Exception:
+            return (await worker.get_chat(invite)).id
     elif target.startswith("@"):
         return (await worker.get_chat(target)).id
     else:

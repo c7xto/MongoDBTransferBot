@@ -16,7 +16,7 @@
 # Regenerate with:
 #   venv\Scripts\python.exe -m pip freeze > requirements-lock.txt
 #
-# Last generated: 2026-07-17
+# Last generated: 2026-08-24
 
 aiohappyeyeballs==2.7.1
 aiohttp==3.14.1
@@ -24,6 +24,7 @@ aiosignal==1.4.0
 attrs==26.1.0
 certifi==2026.6.17
 colorama==0.4.6
+cryptography==50.0.0
 dnspython==2.7.0
 frozenlist==1.8.0
 idna==3.18
@@ -39,7 +40,7 @@ pymongo==4.17.0
 Pyrogram==2.0.106
 PySocks==1.7.1
 pytest==8.4.2
-pytest-asyncio==0.24.0
+pytest-asyncio==1.4.0
 python-dotenv==1.2.2
 TgCrypto==1.2.5
 yarl==1.24.2

@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║      ⚡  C7  M O N G O D B  T R A N S F E R  B O T  —  V1.0       ║
+║      ⚡  C7  M O N G O D B  T R A N S F E R  B O T  —  V2.0       ║
 ║          Multi-User · SaaS-style · MongoDB                       ║
 ╠══════════════════════════════════════════════════════════════════╣
 ║  HOST ENV VARS (.env):                                           ║
@@ -14,7 +14,10 @@
 ╚══════════════════════════════════════════════════════════════════╝
 """
 from __future__ import annotations
-import sys, asyncio, os
+
+import asyncio
+import os
+import sys
 
 # ── Windows event-loop policy (must run before creating any loop) ──
 # Selects the loop *implementation* needed on Windows for Proactor/selector
@@ -37,27 +40,48 @@ except RuntimeError:
     asyncio.set_event_loop(_jumpstart_loop)
 
 # ── Third-Party Imports ──
-from pyrogram import Client, filters, idle, enums
-from pyrogram.types import Message, CallbackQuery
-from pyrogram.errors import FloodWait
 import aiohttp
 from aiohttp import web
-import config as cfg
-from db import (
-    init_master_db, get_user, get_or_create_user,
-    update_user_field, update_user_fields, mark_user_configured,
-    reset_user_config, validate_bot_token, validate_mongo_uri,
-    list_user_databases, list_user_collections, get_user_motor_db,
-    get_all_configured_users, close_all_user_motor_clients,
-    run_user_motor_client_eviction_loop,
-)
-from user_db import init_user_db, get_stats, clear_sent_ids, clear_channel_index, clear_state, load_state, count_sent_ids, get_channel_index_count
-from transfer import run_transfer
-from prescan import run_prescan
-from monitor import run_monitor
-import ui
+from pyrogram import Client, enums, idle
+from pyrogram.errors import FloodWait
+from pyrogram.types import CallbackQuery, Message
 
-print("\n\033[96;1m  ⚡  C7 MONGODB TRANSFER BOT  V1.0  ·  Multi-User Mode  ·  starting up  ⚡\033[0m\n")
+import config as cfg
+import ui
+from db import (
+    close_all_user_motor_clients,
+    get_all_configured_users,
+    get_or_create_user,
+    get_user,
+    get_user_motor_db,
+    get_user_state_db,
+    init_master_db,
+    list_user_collections,
+    list_user_databases,
+    mark_user_configured,
+    reset_user_config,
+    run_user_motor_client_eviction_loop,
+    update_user_field,
+    update_user_fields,
+    validate_bot_token,
+    validate_mongo_uri,
+)
+from monitor import run_monitor
+from prescan import run_prescan
+from transfer import run_transfer
+from user_db import (
+    clear_channel_index,
+    clear_monitor_resume_token,
+    clear_sent_ids,
+    clear_state,
+    count_sent_ids,
+    get_channel_index_count,
+    get_stats,
+    init_user_db,
+    load_state,
+)
+
+print("\n\033[96;1m  ⚡  C7 MONGODB TRANSFER BOT  V2.0  ·  Multi-User Mode  ·  starting up  ⚡\033[0m\n")
 
 # ── Parent bot client ─────────────────────────────────────────────────────────
 # This single Pyrogram client is the public-facing C7 MDTransfer Bot.
@@ -358,7 +382,7 @@ async def _msg_handler_inner(client: Client, message: Message) -> None:
     if cmd in ("/start", "/help"):
         if not user.get("is_configured"):
             return await message.reply(
-                f"⚡ **Welcome to C7 MongoDB Transfer Bot V1.0**\n`{cfg.SEP}`\n\n"
+                f"⚡ **Welcome to C7 MongoDB Transfer Bot V2.0**\n`{cfg.SEP}`\n\n"
                 f"Run `/setup` to configure your personal bot instance.\n\n"
                 f"**What you'll need:**\n"
                 f"› Telegram API ID & Hash\n"
@@ -452,10 +476,11 @@ async def _msg_handler_inner(client: Client, message: Message) -> None:
     elif text == "/wipe":
         if not user.get("is_configured"):
             return await message.reply("⚠️ Run `/setup` first.")
-        user_db = await _get_user_db(user)
+        user_db = await _get_state_db(user)
         await clear_sent_ids(user_db)
         await clear_channel_index(user_db)
         await clear_state(user_db)
+        await clear_monitor_resume_token(user_db)
         cfg.logger.info(f"[ADMIN] All transfer data wiped  user={user_id}")
         return await message.reply(
             f"🗑 **Data Wiped**\n`{cfg.SEP2}`\n"
@@ -618,14 +643,13 @@ async def _cb_set_speed(client, query, user, user_id, data, answer):
     val = float(data.split(":", 1)[1])
     await update_user_field(user_id, "speed_delay", val)
     await answer(f"Speed set to {val}s")
-    updated = await get_user(user_id)
     await query.message.edit_reply_markup(reply_markup=ui.speed_menu(val))
 
 
 async def _cb_wipe_data_confirm(client, query, user, user_id, data, answer):
     await answer()
     try:
-        _wdb = await _get_user_db(user)
+        _wdb = await _get_state_db(user)
         _sent_cnt  = await count_sent_ids(_wdb)
         _idx_cnt   = await get_channel_index_count(_wdb)
     except Exception:
@@ -641,10 +665,11 @@ async def _cb_wipe_data_confirm(client, query, user, user_id, data, answer):
 
 
 async def _cb_wipe_confirmed(client, query, user, user_id, data, answer):
-    user_db = await _get_user_db(user)
+    user_db = await _get_state_db(user)
     await clear_sent_ids(user_db)
     await clear_channel_index(user_db)
     await clear_state(user_db)
+    await clear_monitor_resume_token(user_db)
     await answer("✅ All data wiped")
     cfg.logger.info(f"[ADMIN] All transfer data wiped  user={user_id}")
     await query.message.edit_text(
@@ -743,7 +768,7 @@ async def _cb_ctrl_stop(client, query, user, user_id, data, answer):
 async def _cb_reset_offset(client, query, user, user_id, data, answer):
     if cfg.active_transfers.get(user_id):
         return await answer("⚠️  Stop the transfer first.", alert=True)
-    user_db = await _get_user_db(user)
+    user_db = await _get_state_db(user)
     await clear_state(user_db)
     await answer("🔄  Transfer cursor cleared — next run starts from the beginning",
                  show_alert=False)
@@ -834,7 +859,7 @@ async def _cb_xfer_resume(client, query, user, user_id, data, answer):
                 # Reset only the resume cursor — c7_sent_ids / c7_scan_index
                 # (the actual duplicate-tracking collections) are untouched,
                 # so the fresh scan still skips anything already delivered.
-                user_db = await _get_user_db(target_user)
+                user_db = await _get_state_db(target_user)
                 await clear_state(user_db)
                 cfg.logger.info(
                     f"[SYSTEM] 🔄 User chose Start Fresh — cursor reset  user={owner_id}")
@@ -961,22 +986,24 @@ async def _cb_handler_inner(client: Client, query: CallbackQuery) -> None:
 def _track_task(coro, user_id: int, kind: str) -> asyncio.Task:
     """Schedule coro as a tracked task so crashes are logged and shutdown can
     cancel + await every in-flight task instead of discarding it silently."""
+    task_key = f"{kind}:{user_id}"
+    existing = cfg.active_tasks.get(task_key)
+    if existing is not None and not existing.done():
+        if hasattr(coro, "close"):
+            coro.close()
+        raise RuntimeError(f"Task already running: {task_key}")
     task = asyncio.create_task(coro, name=f"{kind}-{user_id}")
-    cfg.active_tasks[user_id] = task
+    cfg.active_tasks[task_key] = task
 
-    def _on_done(t: asyncio.Task, _uid: int = user_id) -> None:
-        # Only pop if this task is still the one on record — a user can have
-        # a monitor task AND a prescan task in flight simultaneously (no
-        # mutual-exclusion guard exists between those two today), so an
-        # unconditional pop would erase a still-running second task's entry.
-        if cfg.active_tasks.get(_uid) is t:
-            cfg.active_tasks.pop(_uid, None)
+    def _on_done(t: asyncio.Task, _key: str = task_key) -> None:
+        if cfg.active_tasks.get(_key) is t:
+            cfg.active_tasks.pop(_key, None)
         if t.cancelled():
             return
         exc = t.exception()
         if exc is not None:
             cfg.logger.error(
-                f"[MAIN] Background task crashed  user={_uid}  "
+                f"[MAIN] Background task crashed  user={user_id}  "
                 f"name={t.get_name()}  err={exc}")
 
     task.add_done_callback(_on_done)
@@ -998,9 +1025,10 @@ async def _launch_transfer(user: dict) -> None:
     user_id = user["_id"]
     try:
         worker  = await get_or_start_worker(user)
-        user_db = await _get_user_db(user)
-        await init_user_db(user_db)
-        await run_transfer(worker, app, user, user_db)
+        source_db = await _get_user_db(user)
+        state_db = await _get_state_db(user)
+        await init_user_db(state_db)
+        await run_transfer(worker, app, user, source_db, state_db)
     except Exception as e:
         cfg.logger.exception(f"[MAIN] Transfer launch error  user={user_id}  err={e}")
         cfg.active_transfers.pop(user_id, None)
@@ -1011,8 +1039,10 @@ async def _launch_monitor(user: dict) -> None:
     user_id = user["_id"]
     try:
         worker  = await get_or_start_worker(user)
-        user_db = await _get_user_db(user)
-        await run_monitor(worker, app, user, user_db)
+        source_db = await _get_user_db(user)
+        state_db = await _get_state_db(user)
+        await init_user_db(state_db)
+        await run_monitor(worker, app, user, source_db, state_db)
     except Exception as e:
         cfg.logger.exception(f"[MAIN] Monitor launch error  user={user_id}  err={e}")
         cfg.active_monitors.pop(user_id, None)
@@ -1021,9 +1051,10 @@ async def _launch_monitor(user: dict) -> None:
 async def _launch_prescan(user: dict) -> None:
     user_id = user["_id"]
     try:
-        user_db = await _get_user_db(user)
-        await init_user_db(user_db)
-        await run_prescan(app, user, user_db)
+        source_db = await _get_user_db(user)
+        state_db = await _get_state_db(user)
+        await init_user_db(state_db)
+        await run_prescan(app, user, source_db, state_db)
     except Exception as e:
         cfg.logger.exception(f"[MAIN] Prescan launch error  user={user_id}  err={e}")
 
@@ -1034,10 +1065,16 @@ async def _get_user_db(user: dict):
     return await get_user_motor_db(user["mongo_uri"], user["db_name"], user_id=user["_id"])
 
 
+async def _get_state_db(user: dict):
+    """Return the host-owned runtime DB for this transfer tenant."""
+    return await get_user_state_db(user["_id"])
+
+
 async def _get_user_stats(user: dict) -> dict:
     try:
-        user_db = await _get_user_db(user)
-        return await get_stats(user_db, user["col_name"])
+        source_db = await _get_user_db(user)
+        state_db = await _get_state_db(user)
+        return await get_stats(state_db, user["col_name"], source_db=source_db)
     except Exception:
         return {"total_files": 0, "sent_files": 0, "remaining": 0, "last_id": None}
 
@@ -1060,7 +1097,7 @@ async def start_health_server() -> None:
         active_t = sum(1 for v in cfg.active_transfers.values() if v)
         active_m = sum(1 for v in cfg.active_monitors.values()  if v)
         return web.Response(
-            text=f"C7 MongoDB Transfer Bot V1.0 | "
+            text=f"C7 MongoDB Transfer Bot V2.0 | "
                  f"active_transfers={active_t} | "
                  f"active_monitors={active_m} | "
                  f"cached_workers={len(cfg.active_workers)}")
@@ -1116,9 +1153,9 @@ async def _boot_auto_resume() -> None:
     for user in users:
         user_id = user["_id"]
         try:
-            user_db = await _get_user_db(user)
-            state   = await load_state(user_db)
-            if not state.get("last_id"):
+            state_db = await _get_state_db(user)
+            state = await load_state(state_db)
+            if not state.get("last_id") and not state.get("offset"):
                 continue
 
             cfg.logger.info(f"[SYSTEM] ⏳ Waiting for user decision on auto-resume user={user_id}")
@@ -1176,7 +1213,7 @@ if __name__ == "__main__":
     try:
         cfg.logger.info("Starting parent bot client")
         _loop.run_until_complete(safe_start_client(app, "C7 ParentBot"))
-        cfg.logger.info("C7 MongoDB Transfer Bot V1.0 online ⚡")
+        cfg.logger.info("C7 MongoDB Transfer Bot V2.0 online ⚡")
         _loop.run_until_complete(_startup())
         _loop.run_until_complete(idle())
     except KeyboardInterrupt:
