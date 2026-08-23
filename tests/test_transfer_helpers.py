@@ -1,6 +1,7 @@
 import pytest
+from pyrogram.types import InputMediaDocument, InputMediaVideo
 
-from transfer import _cast_last_id, _is_video, _make_media_item
+from transfer import _cast_last_id, _is_video, _make_media_item, _media_kind
 
 
 @pytest.mark.parametrize("name", ["movie.mkv", "movie.MP4", "clip.webm"])
@@ -19,6 +20,29 @@ def test_non_video_detection():
 def test_media_item_accepts_modern_schema():
     item = _make_media_item({"file_id": "BQADdocument", "file_name": "Movie.mkv"})
     assert item.media == "BQADdocument"
+
+
+def test_modern_document_uses_declared_file_type_not_file_id_prefix():
+    item = _make_media_item({
+        "file_id": "BQACmodern",
+        "file_name": "Movie.mkv",
+        "file_type": "document",
+        "mime_type": "video/x-matroska",
+    })
+    assert isinstance(item, InputMediaDocument)
+
+
+def test_modern_video_uses_declared_file_type():
+    item = _make_media_item({
+        "file_id": "BAACmodern",
+        "file_name": "Movie.bin",
+        "file_type": "video",
+    })
+    assert isinstance(item, InputMediaVideo)
+
+
+def test_unknown_modern_id_defaults_to_document():
+    assert _media_kind({"file_id": "BQACmodern", "file_name": "archive.bin"}) == "document"
 
 
 def test_media_item_rejects_missing_id():

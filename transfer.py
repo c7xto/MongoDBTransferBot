@@ -62,16 +62,46 @@ def _is_video(doc: dict) -> bool:
     return False
 
 
+def _media_kind(doc: dict) -> str:
+    """Resolve the Telegram media class without relying on obsolete ID prefixes."""
+    declared = str(doc.get("file_type") or "").lower().strip()
+    if declared in {"document", "video", "audio", "photo"}:
+        return declared
+
+    mime = str(doc.get("mime_type") or "").lower().strip()
+    if mime.startswith("video/"):
+        return "video"
+    if mime.startswith("audio/"):
+        return "audio"
+    if mime.startswith("image/"):
+        return "photo"
+    if mime:
+        return "document"
+
+    # Retain compatibility with older Bot API file IDs. Modern file IDs no
+    # longer expose a stable media-class prefix, so unknown values fall back to
+    # document unless their filename clearly identifies a video.
+    fid = get_file_id(doc) or ""
+    if fid.startswith("AgAD"):
+        return "photo"
+    if fid.startswith("CQAD"):
+        return "audio"
+    if fid.startswith("BQAD"):
+        return "document"
+    return "video" if _is_video(doc) else "document"
+
+
 def _make_media_item(doc: dict):
     cap = f"<code>{doc.get('caption') or doc.get('file_name', 'No Title')}</code>"
     fid = get_file_id(doc)
     if not fid:
         raise ValueError("Source document has no Telegram file_id")
-    if fid.startswith("BQAD"):
+    kind = _media_kind(doc)
+    if kind == "document":
         return InputMediaDocument(media=fid, caption=cap)
-    if fid.startswith("AgAD"):
+    if kind == "photo":
         return InputMediaPhoto(media=fid, caption=cap)
-    if fid.startswith("CQAD"):
+    if kind == "audio":
         return InputMediaAudio(media=fid, caption=cap)
     return InputMediaVideo(media=fid, caption=cap)
 
@@ -91,7 +121,7 @@ async def _send_single(worker: Client, target_id: int, doc: dict) -> None:
     fid  = get_file_id(doc)
     if not fid:
         raise ValueError("Source document has no Telegram file_id")
-    is_v = _is_video(doc)
+    is_v = _media_kind(doc) == "video"
 
     try:
         await worker.send_cached_media(chat_id=target_id, file_id=fid, caption=cap)

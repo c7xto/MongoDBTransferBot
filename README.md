@@ -80,7 +80,7 @@ graph TD
 ## 🔬 Engineering Deep-Dive
 
 ### 🎞️ Universal Media Parser
-Telegram encodes the media class inside the `file_id` itself. The engine reads the prefix directly and constructs the correct `InputMedia*` type with zero probing round-trips: **`BQAD` → Document**, **`AgAD` → Photo**, **`CQAD` → Audio**, with an intelligent fallback to Video — so mixed catalogs (movies, archives, covers, soundtracks) flow through one unified album pipeline.
+Modern Telegram `file_id` prefixes are not a reliable media-type signal. The engine therefore prefers the source record's `file_type`, then its MIME type, then legacy ID prefixes and filename extensions. It constructs the matching `InputMedia*` object without probing Telegram, while unknown records safely fall back to documents. This keeps modern movie-bot document albums on the fast batch path instead of forcing slow per-file retries.
 
 ### 🌊 Dynamic FloodWait Pacing
 Every send path is wrapped in `FloodWait`-aware handling: the exact server-mandated backoff is honored via `asyncio.sleep(e.value)` — never a blocking sleep, so hundreds of concurrent tenant pipelines keep flowing while one waits. On repeated pressure the engine **permanently bumps its per-file delay** (capped at 6.0s), adds randomized jitter to break detectable patterns, and takes 30–60s micro-cooling breaks every 500 batches to protect account health.

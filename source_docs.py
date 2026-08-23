@@ -14,6 +14,7 @@ SOURCE_PROJECTION = {
     "file_unique_id": 1,
     "file_name": 1,
     "file_size": 1,
+    "file_type": 1,
     "mime_type": 1,
     "caption": 1,
 }
