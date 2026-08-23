@@ -81,8 +81,6 @@ from user_db import (
     load_state,
 )
 
-print("\n\033[96;1m  ⚡  C7 MONGODB TRANSFER BOT  V2.0  ·  Multi-User Mode  ·  starting up  ⚡\033[0m\n")
-
 # ── Parent bot client ─────────────────────────────────────────────────────────
 # This single Pyrogram client is the public-facing C7 MDTransfer Bot.
 # Per-user worker clients are managed in cfg.active_workers.
