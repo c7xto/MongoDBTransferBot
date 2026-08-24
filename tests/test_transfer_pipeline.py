@@ -142,3 +142,44 @@ async def test_pipeline_delivers_both_supported_schemas(monkeypatch, documents):
 
 async def _value(value):
     return value
+
+
+@pytest.mark.asyncio
+async def test_duplicate_only_chunks_do_not_inherit_telegram_send_delay(monkeypatch):
+    documents = [
+        {"_id": f"file-{index:04d}", "file_id": f"BQADduplicate{index}", "file_name": f"{index}.mkv"}
+        for index in range(25)
+    ]
+    worker = FakeWorker()
+    sleeps = []
+    saved_states = []
+
+    async def record_sleep(seconds):
+        sleeps.append(seconds)
+
+    async def save_state(db, last_id=None, **values):
+        saved_states.append((last_id, values))
+
+    monkeypatch.setattr(transfer.target_resolve, "resolve_target_chat_id", lambda *a, **k: _value(-1001))
+    monkeypatch.setattr(transfer, "load_state", lambda db: _value({"last_id": None, "offset": 0}))
+    monkeypatch.setattr(transfer, "count_sent_ids", lambda db: _value(len(documents)))
+    monkeypatch.setattr(transfer, "filter_already_sent", lambda db, ids: _value(set(ids)))
+    monkeypatch.setattr(transfer, "filter_in_channel_index", lambda db, keys: _value(set()))
+    monkeypatch.setattr(transfer, "mark_as_sent", lambda db, ids: _value(True))
+    monkeypatch.setattr(transfer, "save_state", save_state)
+    monkeypatch.setattr(transfer, "clear_state", lambda db: _value(None))
+    monkeypatch.setattr(transfer.asyncio, "sleep", record_sleep)
+
+    user_id = 987655
+    cfg.active_transfers[user_id] = True
+    await transfer.run_transfer(
+        worker,
+        FakeAdmin(),
+        {"_id": user_id, "col_name": "files", "target": "-1001", "speed_delay": 3.5},
+        FakeSourceDB(documents),
+        object(),
+    )
+
+    assert worker.groups == []
+    assert sleeps == []
+    assert saved_states

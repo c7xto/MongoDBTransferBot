@@ -399,6 +399,9 @@ async def run_transfer(
         ALBUM = 10
         keep   = True
         chunks = 0
+        # Telegram pacing protects actual delivery calls. Duplicate-only
+        # chunks never contact Telegram and must not inherit send delays.
+        delivery_chunks = 0
         speed  = current_speed
 
         while keep and count < total:
@@ -511,6 +514,7 @@ async def run_transfer(
                     L.info(f"[XFER] Skipped {skipped} duplicate(s)  user={user_id}")
                     skipped_files += skipped
 
+                has_fresh = bool(fresh)
                 if not fresh:
                     count   += skipped
                     last_id = chunk[-1]["_id"]
@@ -600,6 +604,9 @@ async def run_transfer(
 
                     chunks += 1
 
+                if has_fresh:
+                    delivery_chunks += 1
+
                 # ── Console progress log ──────────────────────────────────────
                 if chunks % 5 == 0:
                     pct      = (count / total * 100) if total else 0
@@ -647,17 +654,24 @@ async def run_transfer(
                                      progress_now)
                     last_ui_edit = now_t   # advance timer regardless of edit result
 
-                # ── Speed jitter (anti-pattern protection) ────────────────────
-                jitter = random.uniform(-0.5, 1.2)
-                await asyncio.sleep(max(0.5, speed + jitter))
+                # ── Telegram pacing (delivery chunks only) ────────────────────
+                # Duplicate-only chunks perform MongoDB membership checks but
+                # make no Telegram API calls, so delaying them cannot protect
+                # the account and makes resume scans unnecessarily slow.
+                if has_fresh:
+                    jitter = random.uniform(-0.5, 1.2)
+                    await asyncio.sleep(max(0.5, speed + jitter))
 
-                # ── Micro-cooling break every 500 chunks (stealth) ────────────
-                if chunks > 0 and chunks % 500 == 0:
-                    break_secs = random.randint(30, 60)
-                    L.info(
-                        f"💤 [STEALTH] Taking a {break_secs}s micro-cooling break "
-                        f"to protect account health…  chunks={chunks}  user={user_id}")
-                    await asyncio.sleep(break_secs)
+                    # Cool only after 500 actual delivery attempts. Counting
+                    # duplicate scans here previously added minute-long pauses
+                    # while the bot was not sending anything.
+                    if delivery_chunks % 500 == 0:
+                        break_secs = random.randint(30, 60)
+                        L.info(
+                            f"💤 [STEALTH] Taking a {break_secs}s micro-cooling break "
+                            f"to protect account health…  delivery_chunks={delivery_chunks}  "
+                            f"user={user_id}")
+                        await asyncio.sleep(break_secs)
 
         # ── Save final cursor ────────────────────────────────────────────────
         await save_state(

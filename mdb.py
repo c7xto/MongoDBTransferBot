@@ -702,7 +702,7 @@ async def _cb_ctrl_pause(client, query, user, user_id, data, answer):
     prog = cfg.transfer_progress.get(user_id, {})
     _cnt = prog.get("count", 0); _tot = prog.get("total", 1)
     _pct = _cnt / _tot * 100 if _tot else 0
-    await answer(f"⏸️  Paused at {_pct:.1f}%  ·  cursor is safe", show_alert=False)
+    await answer(f"⏸️  Paused at {_pct:.1f}%  ·  cursor is safe", alert=False)
     try:
         await query.message.edit_text(
             ui.build_progress_snapshot_card(prog, ui.TransferState.PAUSED),
@@ -716,7 +716,7 @@ async def _cb_ctrl_resume(client, query, user, user_id, data, answer):
     prog = cfg.transfer_progress.get(user_id, {})
     _cnt = prog.get("count", 0); _tot = prog.get("total", 1)
     _pct = _cnt / _tot * 100 if _tot else 0
-    await answer(f"▶️  Resuming from {_pct:.1f}%", show_alert=False)
+    await answer(f"▶️  Resuming from {_pct:.1f}%", alert=False)
     try:
         await query.message.edit_text(
             ui.build_progress_snapshot_card(prog, ui.TransferState.RUNNING),
@@ -733,7 +733,7 @@ async def _cb_ctrl_stop(client, query, user, user_id, data, answer):
     cfg.paused_transfers.pop(user_id, None)
     prog = cfg.transfer_progress.get(user_id, {})
     _sent = prog.get("sent", 0)
-    await answer(f"⏹️  Stopped  ·  {_sent:,} files sent  ·  cursor saved", show_alert=False)
+    await answer(f"⏹️  Stopped  ·  {_sent:,} files sent  ·  cursor saved", alert=False)
     # Build terminal card immediately; pop msg_id so the loop's finally block
     # doesn't attempt a second edit on the same message.
     msg_id = cfg.progress_msg_ids.pop(user_id, None)
@@ -754,7 +754,7 @@ async def _cb_reset_offset(client, query, user, user_id, data, answer):
     user_db = await _get_state_db(user)
     await clear_state(user_db)
     await answer("🔄  Transfer cursor cleared — next run starts from the beginning",
-                 show_alert=False)
+                 alert=False)
     await query.message.edit_text(
         f"⚙️ **Configuration**\n`{cfg.SEP2}`\n"
         f"✅ Transfer offset cleared.\nTap a field to update it:",
