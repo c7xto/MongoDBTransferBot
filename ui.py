@@ -60,6 +60,12 @@ def build_progress_card(
         elapsed: float,
         failed:  int = 0,
         state:   TransferState | str = TransferState.RUNNING,
+        *,
+        sent: int | None = None,
+        skipped: int = 0,
+        send_total: int | None = None,
+        delivery_rate: float | None = None,
+        eta_seconds: float | None = None,
 ) -> str:
     """
     Build the live transfer progress card text.
@@ -82,9 +88,20 @@ def build_progress_card(
             "📅 ETA › `Calculating…`"
         )
 
-    pct      = count / total * 100
-    rate     = count / elapsed if elapsed > 0 else 0.0
-    eta_secs = (total - count) / rate if rate > 0 else 0.0
+    # Detailed transfer snapshots keep source scanning separate from actual
+    # Telegram delivery. Duplicate skips can process thousands of records per
+    # second, so using ``count / elapsed`` would produce a wildly optimistic
+    # ETA for a transfer that still has days of Telegram sends remaining.
+    detailed = sent is not None and send_total is not None
+    if detailed:
+        completed = min(send_total, max(0, sent) + max(0, failed))
+        pct = (completed / send_total * 100) if send_total else 100.0
+        rate = max(0.0, delivery_rate or 0.0)
+        eta_secs = eta_seconds or 0.0
+    else:
+        pct = count / total * 100
+        rate = count / elapsed if elapsed > 0 else 0.0
+        eta_secs = (total - count) / rate if rate > 0 else 0.0
     bar      = _progress_bar(pct)
 
     headers = {
@@ -95,23 +112,58 @@ def build_progress_card(
     }
     header = headers.get(state, "⏳ **TRANSFER PIPELINE STATUS**")
 
-    lines = [
-        header,
-        f"`{'─' * 28}`",
-        f"📦 Progress › `{count:,}` / `{total:,}` · `{pct:.1f}%`",
-        f"`{bar}`",
-        f"⚡ Speed › `{rate:.1f}` files/sec",
-    ]
+    if detailed:
+        lines = [
+            header,
+            f"`{'─' * 28}`",
+            f"📤 Transfer › `{completed:,}` / `{send_total:,}` · `{pct:.1f}%`",
+            f"`{bar}`",
+            f"✅ Sent now › `{max(0, sent):,}`",
+            f"⏭ Skipped this run › `{max(0, skipped):,}`",
+            f"🔎 Source checked › `{count:,}` / `{total:,}`",
+            f"⚡ Live speed › `{rate * 60:.1f}` files/min" if rate > 0
+            else "⚡ Live speed › `Calculating…`",
+        ]
+    else:
+        lines = [
+            header,
+            f"`{'─' * 28}`",
+            f"📦 Progress › `{count:,}` / `{total:,}` · `{pct:.1f}%`",
+            f"`{bar}`",
+            f"⚡ Speed › `{rate:.1f}` files/sec",
+        ]
 
     if state in ("running", "paused"):
         lines.append(f"📅 ETA › `{_fmt_eta(eta_secs)}`")
     else:
         lines.append(f"⏱ Elapsed › `{_fmt_elapsed(elapsed)}`")
 
+    if detailed:
+        lines.append(f"⏱ Running › `{_fmt_elapsed(elapsed)}`")
+
     if failed:
         lines.append(f"⚠️ Failed › `{failed}`")
 
     return "\n".join(lines)
+
+
+def build_progress_snapshot_card(
+        progress: dict,
+        state: TransferState | str = TransferState.RUNNING,
+) -> str:
+    """Render a transfer snapshot shared by live edits and control buttons."""
+    return build_progress_card(
+        progress.get("count", 0),
+        progress.get("total", 0),
+        progress.get("elapsed", 0.0),
+        progress.get("failed", 0),
+        state,
+        sent=progress.get("sent"),
+        skipped=progress.get("skipped", 0),
+        send_total=progress.get("send_total"),
+        delivery_rate=progress.get("delivery_rate"),
+        eta_seconds=progress.get("eta_seconds"),
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════

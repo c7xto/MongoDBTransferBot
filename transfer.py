@@ -10,6 +10,7 @@ import asyncio
 import io
 import random
 import time
+from collections import deque
 
 from bson import ObjectId
 from pyrogram import Client
@@ -44,7 +45,7 @@ _VIDEO_EXTS = {
 
 # How often (seconds) the live Telegram card is edited while a transfer runs.
 # Keep ≥ 10 s to stay well clear of Telegram's edit rate limit.
-_UI_EDIT_INTERVAL = 15.0
+_UI_EDIT_INTERVAL = 10.0
 
 # Network resilience: how long to pause after a connection drop, and how many
 # times to retry a single batch before giving up the entire transfer.
@@ -192,6 +193,7 @@ async def _edit_card(
         elapsed:   float,
         failed:    int,
         state:     str,
+        progress:  dict | None = None,
 ) -> None:
     """
     Edit the live progress card for this user.
@@ -206,7 +208,9 @@ async def _edit_card(
         await admin_app.edit_message_text(
             admin_id,
             msg_id,
-            ui.build_progress_card(count, total, elapsed, failed, state),
+            (ui.build_progress_snapshot_card(progress, state)
+             if progress else
+             ui.build_progress_card(count, total, elapsed, failed, state)),
             reply_markup=ui.live_controls(state))
     except Exception:
         pass
@@ -294,8 +298,47 @@ async def run_transfer(
     # Initialise to safe defaults so finally-block can always reference them
     count = 0
     total = 0
+    sent_files = 0
+    skipped_files = 0
+    send_total = 0
+    delivery_rate = 0.0
+    eta_seconds = 0.0
+    rate_samples: deque[tuple[float, int]] = deque()
     if state_db is None:
         raise RuntimeError("Host-owned state database is required")
+
+    def _snapshot(now: float | None = None) -> dict:
+        """Build a live snapshot using recent successful Telegram sends."""
+        nonlocal delivery_rate, eta_seconds
+        now = now or time.time()
+        rate_samples.append((now, sent_files))
+        cutoff = now - 300.0
+        while len(rate_samples) > 2 and rate_samples[1][0] < cutoff:
+            rate_samples.popleft()
+
+        first_t, first_sent = rate_samples[0]
+        span = now - first_t
+        delivered = sent_files - first_sent
+        if delivered > 0 and span > 0:
+            delivery_rate = delivered / span
+        elif sent_files > 0 and now > transfer_start:
+            delivery_rate = sent_files / (now - transfer_start)
+
+        remaining = max(0, send_total - sent_files - len(failed_files))
+        eta_seconds = remaining / delivery_rate if delivery_rate > 0 else 0.0
+        snapshot = {
+            "count": count,
+            "total": total,
+            "elapsed": now - transfer_start,
+            "failed": len(failed_files),
+            "sent": sent_files,
+            "skipped": skipped_files,
+            "send_total": send_total,
+            "delivery_rate": delivery_rate,
+            "eta_seconds": eta_seconds,
+        }
+        cfg.transfer_progress[user_id] = snapshot
+        return snapshot
 
     L.info(f"[XFER] Transfer started  user={user_id}  speed={current_speed}s")
 
@@ -317,6 +360,8 @@ async def run_transfer(
         state = await load_state(state_db)
         total = await col.count_documents({})
         sent_before = await count_sent_ids(state_db)
+        send_total = max(0, total - sent_before)
+        rate_samples.append((transfer_start, 0))
 
         # Keyset pagination is safe only for naturally ordered identifiers.
         # Many auto-filter databases put a Telegram file_id string in `_id`;
@@ -344,12 +389,10 @@ async def run_transfer(
 
         # Push initial snapshot so the card shows real totals immediately
         elapsed_now = time.time() - transfer_start
-        cfg.transfer_progress[user_id] = {
-            "count": count, "total": total,
-            "elapsed": elapsed_now, "failed": 0,
-        }
+        initial_progress = _snapshot()
         await _edit_card(admin_app, admin_id, user_id,
-                         count, total, elapsed_now, 0, ui.TransferState.RUNNING)
+                         count, total, elapsed_now, 0, ui.TransferState.RUNNING,
+                         initial_progress)
         last_ui_edit = time.time()
 
         BATCH = 1000
@@ -399,6 +442,8 @@ async def run_transfer(
             if invalid_count:
                 L.warning(f"[XFER] Skipping {invalid_count} source document(s) without file_id  user={user_id}")
                 count += invalid_count
+                skipped_files += invalid_count
+                send_total = max(sent_files + len(failed_files), send_total - invalid_count)
             if not valid_batch:
                 if cursor_mode == "offset":
                     scan_offset += len(batch)
@@ -424,6 +469,11 @@ async def run_transfer(
             in_index_set = await filter_in_channel_index(state_db, keys_by_file)
             if in_index_set:
                 await mark_as_sent(state_db, list(in_index_set))
+                newly_indexed = in_index_set - already_sent_set
+                send_total = max(
+                    sent_files + len(failed_files),
+                    send_total - len(newly_indexed),
+                )
 
             for i in range(0, len(valid_batch), ALBUM):
                 chunk = valid_batch[i:i + ALBUM]
@@ -459,6 +509,7 @@ async def run_transfer(
                 skipped = len(skipped_ids)
                 if skipped:
                     L.info(f"[XFER] Skipped {skipped} duplicate(s)  user={user_id}")
+                    skipped_files += skipped
 
                 if not fresh:
                     count   += skipped
@@ -471,6 +522,7 @@ async def run_transfer(
                     try:
                         await worker.send_media_group(chat_id=target_id, media=media_group)
                         await mark_as_sent(state_db, [get_file_id(d) for d in chunk])
+                        sent_files += len(chunk)
                         count  += len(chunk) + skipped
                         last_id = chunk[-1]["_id"]
 
@@ -485,12 +537,14 @@ async def run_transfer(
                         already_sent = bool(await filter_already_sent(state_db, [first_fid]))
                         if already_sent:
                             L.info(f"[XFER] FloodWait retry skipped — original send succeeded  user={user_id}")
+                            sent_files += len(chunk)
                             count  += len(chunk) + skipped
                             last_id = chunk[-1]["_id"]
                         else:
                             try:
                                 await worker.send_media_group(chat_id=target_id, media=media_group)
                                 await mark_as_sent(state_db, [get_file_id(d) for d in chunk])
+                                sent_files += len(chunk)
                                 count  += len(chunk) + skipped
                                 last_id = chunk[-1]["_id"]
                                 L.info(f"[XFER] FloodWait retry succeeded  user={user_id}")
@@ -518,6 +572,7 @@ async def run_transfer(
                             try:
                                 await worker.send_media_group(chat_id=target_id, media=media_group)
                                 await mark_as_sent(state_db, [get_file_id(d) for d in chunk])
+                                sent_files += len(chunk)
                                 count  += len(chunk) + skipped
                                 last_id = chunk[-1]["_id"]
                                 L.info(f"[CONN] Post-refresh retry succeeded  user={user_id}")
@@ -534,6 +589,7 @@ async def run_transfer(
                                 try:
                                     await _send_single(worker, target_id, doc)
                                     await mark_as_sent(state_db, [get_file_id(doc)])
+                                    sent_files += 1
                                 except Exception as sub_e:
                                     failed_files.append(f"ID: {get_file_id(doc)} | {sub_e}")
                                     L.error(f"[XFER] Individual send failed  id={get_file_id(doc)}  "
@@ -549,11 +605,10 @@ async def run_transfer(
                     pct      = (count / total * 100) if total else 0
                     _filled  = int(round(pct / 100 * 10))
                     _bar     = "■" * _filled + "□" * (10 - _filled)
-                    _elapsed = time.time() - transfer_start
-                    _rate    = count / _elapsed if _elapsed > 0 else 0
-                    _rem     = total - count
+                    progress_now = _snapshot()
+                    _rate = progress_now["delivery_rate"]
                     if _rate > 0:
-                        _s = _rem / _rate
+                        _s = progress_now["eta_seconds"]
                         _eta = (f"{_s/86400:.1f}d" if _s >= 86400
                                 else f"{_s/3600:.1f}h" if _s >= 3600
                                 else f"{_s/60:.0f}m")
@@ -562,7 +617,8 @@ async def run_transfer(
                     _k = lambda n: f"{n/1000:.0f}k" if n >= 1000 else str(n)
                     L.info(
                         f"[XFER] [{_bar}] {pct:.0f}% │ {_k(count)}/{_k(total)} │ "
-                        f"ETA: {_eta} │ Spd: {speed:.1f}s/file  user={user_id}")
+                        f"sent={_k(sent_files)}/{_k(send_total)} │ "
+                        f"ETA: {_eta} │ Rate: {_rate * 60:.1f}/min  user={user_id}")
 
                 if cursor_mode == "offset":
                     # Offset advances by source documents, including malformed
@@ -581,18 +637,14 @@ async def run_transfer(
                 # ── Live progress snapshot (for callback handlers) ─────────────
                 now_t       = time.time()
                 elapsed_now = now_t - transfer_start
-                cfg.transfer_progress[user_id] = {
-                    "count":   count,
-                    "total":   total,
-                    "elapsed": elapsed_now,
-                    "failed":  len(failed_files),
-                }
+                progress_now = _snapshot(now_t)
 
                 # ── Throttled Telegram card edit (every 15 s) ─────────────────
                 if now_t - last_ui_edit >= _UI_EDIT_INTERVAL:
                     await _edit_card(admin_app, admin_id, user_id,
                                      count, total, elapsed_now,
-                                     len(failed_files), ui.TransferState.RUNNING)
+                                     len(failed_files), ui.TransferState.RUNNING,
+                                     progress_now)
                     last_ui_edit = now_t   # advance timer regardless of edit result
 
                 # ── Speed jitter (anti-pattern protection) ────────────────────
@@ -620,15 +672,17 @@ async def run_transfer(
         # ── Transfer completed naturally ──────────────────────────────────────
         if cfg.active_transfers.get(user_id) and count >= total:
             await clear_state(state_db)
-            L.info(f"[XFER] Transfer complete  sent={count:,}  "
+            L.info(f"[XFER] Transfer complete  sent={sent_files:,}  skipped={skipped_files:,}  "
                    f"failed={len(failed_files)}  elapsed={elapsed_final:.0f}s  user={user_id}")
             await _edit_card(admin_app, admin_id, user_id,
-                             count, total, elapsed_final, len(failed_files), ui.TransferState.DONE)
+                             count, total, elapsed_final, len(failed_files), ui.TransferState.DONE,
+                             _snapshot())
             try:
                 await admin_app.send_message(
                     admin_id,
                     f"✅ **Transfer Complete**\n"
-                    f"📦 Sent › `{count:,}`\n"
+                    f"📤 Sent now › `{sent_files:,}`\n"
+                    f"⏭ Skipped › `{skipped_files:,}`\n"
                     f"❌ Failed › `{len(failed_files)}`\n"
                     f"⏱ Elapsed › `{ui._fmt_elapsed(elapsed_final)}`")
             except Exception:
@@ -637,7 +691,8 @@ async def run_transfer(
         # ── Stopped by /stop command (no button, so msg_id still present) ────
         elif cfg.progress_msg_ids.get(user_id):
             await _edit_card(admin_app, admin_id, user_id,
-                             count, total, elapsed_final, len(failed_files), ui.TransferState.STOPPED)
+                             count, total, elapsed_final, len(failed_files), ui.TransferState.STOPPED,
+                             _snapshot())
 
     except Exception as e:
         L.exception(f"[XFER] Worker error  err={e}  user={user_id}")
@@ -652,7 +707,8 @@ async def run_transfer(
         leftover_msg  = cfg.progress_msg_ids.get(user_id)
         if leftover_msg:
             await _edit_card(admin_app, admin_id, user_id,
-                             count, total, elapsed_final, len(failed_files), ui.TransferState.STOPPED)
+                             count, total, elapsed_final, len(failed_files), ui.TransferState.STOPPED,
+                             _snapshot())
 
         # Clean up progress snapshot
         cfg.transfer_progress.pop(user_id, None)

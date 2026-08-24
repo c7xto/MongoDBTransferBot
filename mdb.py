@@ -705,12 +705,7 @@ async def _cb_ctrl_pause(client, query, user, user_id, data, answer):
     await answer(f"⏸️  Paused at {_pct:.1f}%  ·  cursor is safe", show_alert=False)
     try:
         await query.message.edit_text(
-            ui.build_progress_card(
-                prog.get("count",   0),
-                prog.get("total",   0),
-                prog.get("elapsed", 0.0),
-                prog.get("failed",  0),
-                ui.TransferState.PAUSED),
+            ui.build_progress_snapshot_card(prog, ui.TransferState.PAUSED),
             reply_markup=ui.live_controls(ui.TransferState.PAUSED))
     except Exception:
         pass
@@ -724,12 +719,7 @@ async def _cb_ctrl_resume(client, query, user, user_id, data, answer):
     await answer(f"▶️  Resuming from {_pct:.1f}%", show_alert=False)
     try:
         await query.message.edit_text(
-            ui.build_progress_card(
-                prog.get("count",   0),
-                prog.get("total",   0),
-                prog.get("elapsed", 0.0),
-                prog.get("failed",  0),
-                ui.TransferState.RUNNING),
+            ui.build_progress_snapshot_card(prog, ui.TransferState.RUNNING),
             reply_markup=ui.live_controls(ui.TransferState.RUNNING))
     except Exception:
         pass
@@ -742,8 +732,8 @@ async def _cb_ctrl_stop(client, query, user, user_id, data, answer):
     cfg.active_transfers.pop(user_id, None)
     cfg.paused_transfers.pop(user_id, None)
     prog = cfg.transfer_progress.get(user_id, {})
-    _cnt = prog.get("count", 0)
-    await answer(f"⏹️  Stopped  ·  {_cnt:,} files sent  ·  cursor saved", show_alert=False)
+    _sent = prog.get("sent", 0)
+    await answer(f"⏹️  Stopped  ·  {_sent:,} files sent  ·  cursor saved", show_alert=False)
     # Build terminal card immediately; pop msg_id so the loop's finally block
     # doesn't attempt a second edit on the same message.
     msg_id = cfg.progress_msg_ids.pop(user_id, None)
@@ -752,12 +742,7 @@ async def _cb_ctrl_stop(client, query, user, user_id, data, answer):
             await app.edit_message_text(
                 user_id,
                 msg_id,
-                ui.build_progress_card(
-                    prog.get("count",   0),
-                    prog.get("total",   0),
-                    prog.get("elapsed", 0.0),
-                    prog.get("failed",  0),
-                    ui.TransferState.STOPPED),
+                ui.build_progress_snapshot_card(prog, ui.TransferState.STOPPED),
                 reply_markup=ui.live_controls(ui.TransferState.STOPPED))
         except Exception:
             pass
