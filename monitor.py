@@ -51,7 +51,7 @@ async def run_monitor(
     user_id  = user_cfg["_id"]
     admin_id = user_id
     if state_db is None:
-        state_db = source_db
+        raise RuntimeError("Host-owned state database is required")
 
     if cfg.active_monitors.get(user_id):
         L.warning(f"[MON] Monitor already running  user={user_id}")

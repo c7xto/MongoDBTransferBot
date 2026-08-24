@@ -273,7 +273,7 @@ async def run_transfer(
     Main transfer engine.
     user_cfg keys used: mongo_uri, db_name, col_name, target, speed_delay, _id.
     ``source_db`` is read-only catalogue access. ``state_db`` stores mutable
-    checkpoints and deduplication; it defaults to source_db for compatibility.
+    checkpoints and duplicate records on the host-owned database.
     """
     user_id    = user_cfg["_id"]
     col_name   = user_cfg["col_name"]
@@ -295,7 +295,7 @@ async def run_transfer(
     count = 0
     total = 0
     if state_db is None:
-        state_db = source_db
+        raise RuntimeError("Host-owned state database is required")
 
     L.info(f"[XFER] Transfer started  user={user_id}  speed={current_speed}s")
 

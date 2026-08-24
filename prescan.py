@@ -38,7 +38,7 @@ async def run_prescan(
     user_id  = user_cfg["_id"]
     admin_id = user_id
     if state_db is None:
-        state_db = source_db
+        raise RuntimeError("Host-owned state database is required")
 
     L.info(f"[SCAN] Pre-scan started  user={user_id}")
 
