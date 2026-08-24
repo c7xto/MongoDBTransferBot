@@ -1201,6 +1201,38 @@ async def _startup() -> None:
     cfg.logger.info("[SYSTEM] Listening for Telegram updates — idle()")
 
 
+async def _run_main() -> None:
+    """Run startup and idle while the event loop is already active.
+
+    Pyrogram exposes sync-friendly wrappers around its async methods. Calling
+    those wrappers before ``run_until_complete`` makes them consume their own
+    coroutine and return ``None`` on newer Python versions. Keeping the whole
+    lifecycle inside one running loop avoids that double execution.
+    """
+    cfg.logger.info("Starting parent bot client")
+    await safe_start_client(app, "C7 ParentBot")
+    cfg.logger.info("C7 MongoDB Transfer Bot V2.0 online ⚡")
+    await _startup()
+    await idle()
+
+
+async def _shutdown() -> None:
+    cfg.logger.info(
+        f"Shutting down — cancelling {len(cfg.active_tasks)} tracked background task(s)")
+    pending = list(cfg.active_tasks.values())
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+
+    cfg.logger.info("Shutting down — stopping all worker clients")
+    await stop_all_workers()
+    close_all_user_motor_clients()
+    if app.is_connected:
+        cfg.logger.info("Stopping parent bot")
+        await app.stop()
+
+
 if __name__ == "__main__":
     # Use the event loop that already exists at import time — the same one
     # that Client.__init__ captured for app.loop and app.dispatcher.loop.
@@ -1209,24 +1241,9 @@ if __name__ == "__main__":
     # and never run, so updates arrive but handlers are never invoked.
     _loop = asyncio.get_event_loop()
     try:
-        cfg.logger.info("Starting parent bot client")
-        _loop.run_until_complete(safe_start_client(app, "C7 ParentBot"))
-        cfg.logger.info("C7 MongoDB Transfer Bot V2.0 online ⚡")
-        _loop.run_until_complete(_startup())
-        _loop.run_until_complete(idle())
+        _loop.run_until_complete(_run_main())
     except KeyboardInterrupt:
         pass
     finally:
-        cfg.logger.info(f"Shutting down — cancelling {len(cfg.active_tasks)} tracked background task(s)")
-        _pending = list(cfg.active_tasks.values())  # snapshot: done-callbacks mutate the dict as tasks finish
-        for _t in _pending:
-            _t.cancel()
-        if _pending:
-            _loop.run_until_complete(asyncio.gather(*_pending, return_exceptions=True))
-
-        cfg.logger.info("Shutting down — stopping all worker clients")
-        _loop.run_until_complete(stop_all_workers())
-        close_all_user_motor_clients()
-        cfg.logger.info("Stopping parent bot")
-        _loop.run_until_complete(app.stop())
+        _loop.run_until_complete(_shutdown())
         _loop.close()
