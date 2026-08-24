@@ -394,6 +394,10 @@ async def _msg_handler_inner(client: Client, message: Message) -> None:
 
     # /setup
     elif text == "/setup":
+        busy = _blocking_operation(user_id)
+        if busy:
+            return await message.reply(
+                f"⚠️ Stop {busy} before resetting configuration.")
         if user.get("is_configured"):
             return await message.reply(
                 f"⚠️ **Reset Configuration?**\n`{cfg.SEP2}`\n\n"
@@ -424,12 +428,15 @@ async def _msg_handler_inner(client: Client, message: Message) -> None:
         if not user.get("is_configured"):
             return await message.reply("⚠️ Run `/setup` first.")
         async with _get_launch_lock(user_id):
-            if cfg.active_transfers.get(user_id):
-                return await message.reply("⚠️ Transfer already running.")
+            busy = _blocking_operation(user_id)
+            if busy:
+                return await message.reply(f"⚠️ {busy} is already running. Stop it first.")
             cfg.active_transfers[user_id] = True
             cfg.paused_transfers.pop(user_id, None)
         card_msg = await message.reply(
-            ui.build_progress_card(0, 0, 0.0, 0, ui.TransferState.RUNNING),
+            ui.build_progress_card(
+                0, 0, 0.0, 0, ui.TransferState.RUNNING,
+                status="Starting secure Telegram worker"),
             reply_markup=ui.live_controls(ui.TransferState.RUNNING))
         cfg.progress_msg_ids[user_id] = card_msg.id
         _track_task(_launch_transfer(user), user_id, "transfer")
@@ -449,40 +456,58 @@ async def _msg_handler_inner(client: Client, message: Message) -> None:
             return await message.reply("⚠️ Run `/setup` first.")
         if cfg.active_transfers.get(user_id):
             return await message.reply("⚠️ Stop transfer first.")
-        await message.reply("🔎 **Starting pre-scan…**")
+        if _task_running(user_id, "monitor") or cfg.active_monitors.get(user_id):
+            return await message.reply("⚠️ Stop the live monitor first.")
+        if _task_running(user_id, "prescan"):
+            return await message.reply("⚠️ Pre-scan is already running. Check its live status card.")
         _track_task(_launch_prescan(user), user_id, "prescan")
+        await message.reply("🔎 **Starting pre-scan…** A live status card will appear below.")
+
+    # /stopprescan
+    elif text == "/stopprescan":
+        if not _cancel_task(user_id, "prescan"):
+            return await message.reply("⚠️ No pre-scan is running.")
+        return await message.reply("⏹️ **Pre-scan stopping…** The status card will be updated.")
 
     # /monitor
     elif text == "/monitor":
         if not user.get("is_configured"):
             return await message.reply("⚠️ Run `/setup` first.")
-        if cfg.active_monitors.get(user_id):
+        if cfg.active_monitors.get(user_id) or _task_running(user_id, "monitor"):
             return await message.reply("⚠️ Monitor already running.")
         if cfg.active_transfers.get(user_id):
             return await message.reply("⚠️ Stop transfer first.")
-        await message.reply("👁 **Starting live monitor…**")
+        if _task_running(user_id, "prescan"):
+            return await message.reply("⚠️ Stop the pre-scan first.")
         _track_task(_launch_monitor(user), user_id, "monitor")
+        await message.reply("👁 **Starting live monitor…** A persistent status card will appear below.")
 
     # /stopmonitor
     elif text == "/stopmonitor":
-        if not cfg.active_monitors.get(user_id):
+        if not (cfg.active_monitors.get(user_id) or _task_running(user_id, "monitor")):
             return await message.reply("⚠️ No monitor running.")
         cfg.active_monitors.pop(user_id, None)
-        return await message.reply("🔴 **Monitor stopping…**")
+        _cancel_task(user_id, "monitor")
+        return await message.reply("🔴 **Monitor stopping…** The status card will be updated.")
 
     # /wipe
     elif text == "/wipe":
         if not user.get("is_configured"):
             return await message.reply("⚠️ Run `/setup` first.")
+        busy = _blocking_operation(user_id)
+        if busy:
+            return await message.reply(f"⚠️ Stop {busy} before wiping data.")
         user_db = await _get_state_db(user)
-        await clear_sent_ids(user_db)
-        await clear_channel_index(user_db)
-        await clear_state(user_db)
-        await clear_monitor_resume_token(user_db)
-        cfg.logger.info(f"[ADMIN] All transfer data wiped  user={user_id}")
+        sent_count = await count_sent_ids(user_db)
+        index_count = await get_channel_index_count(user_db)
         return await message.reply(
-            f"🗑 **Data Wiped**\n`{cfg.SEP2}`\n"
-            f"Cleared: sent_ids, scan_index, transfer_state")
+            f"⚠️ **Confirm Data Wipe**\n`{cfg.SEP2}`\n\n"
+            f"This will permanently delete:\n"
+            f"• `{sent_count:,}` sent file IDs\n"
+            f"• `{index_count:,}` scan index entries\n"
+            f"• Transfer resume cursor\n\n"
+            f"**This cannot be undone.** Are you sure?",
+            reply_markup=ui.wipe_confirm_menu())
 
     # /config — shortcut to see current configuration
     elif text == "/config":
@@ -524,9 +549,15 @@ async def cb_handler(client: Client, query: CallbackQuery) -> None:
 async def _cb_go_home(client, query, user, user_id, data, answer):
     await answer()
     stats = await _get_user_stats(user)
-    await query.message.edit_text(
-        ui.home_card_text(stats, user_id),
-        reply_markup=ui.home_menu(user_id))
+    try:
+        await query.message.edit_text(
+            ui.home_card_text(stats, user_id),
+            reply_markup=ui.home_menu(user_id))
+    except Exception as exc:
+        # Re-tapping Home on an already-current dashboard is a successful
+        # no-op, not an internal bot error.
+        if "MESSAGE_NOT_MODIFIED" not in str(exc):
+            raise
 
 
 async def _cb_show_stats(client, query, user, user_id, data, answer):
@@ -645,6 +676,9 @@ async def _cb_set_speed(client, query, user, user_id, data, answer):
 
 
 async def _cb_wipe_data_confirm(client, query, user, user_id, data, answer):
+    busy = _blocking_operation(user_id)
+    if busy:
+        return await answer(f"⚠️ Stop {busy} before wiping data.", alert=True)
     await answer()
     try:
         _wdb = await _get_state_db(user)
@@ -663,6 +697,9 @@ async def _cb_wipe_data_confirm(client, query, user, user_id, data, answer):
 
 
 async def _cb_wipe_confirmed(client, query, user, user_id, data, answer):
+    busy = _blocking_operation(user_id)
+    if busy:
+        return await answer(f"⚠️ Stop {busy} before wiping data.", alert=True)
     user_db = await _get_state_db(user)
     await clear_sent_ids(user_db)
     await clear_channel_index(user_db)
@@ -680,14 +717,17 @@ async def _cb_start_transfer(client, query, user, user_id, data, answer):
     if not user.get("is_configured"):
         return await answer("⚠️ Run /setup first.", alert=True)
     async with _get_launch_lock(user_id):
-        if cfg.active_transfers.get(user_id):
-            return await answer("⚠️ Transfer already running.", alert=True)
+        busy = _blocking_operation(user_id)
+        if busy:
+            return await answer(f"⚠️ {busy} is already running. Stop it first.", alert=True)
         cfg.active_transfers[user_id] = True
         cfg.paused_transfers.pop(user_id, None)
     await answer("🚀 Starting transfer…")
     card_msg = await app.send_message(
         user_id,
-        ui.build_progress_card(0, 0, 0.0, 0, ui.TransferState.RUNNING),
+        ui.build_progress_card(
+            0, 0, 0.0, 0, ui.TransferState.RUNNING,
+            status="Starting secure Telegram worker"),
         reply_markup=ui.live_controls(ui.TransferState.RUNNING))
     cfg.progress_msg_ids[user_id] = card_msg.id
     _track_task(_launch_transfer(user), user_id, "transfer")
@@ -726,14 +766,36 @@ async def _cb_ctrl_resume(client, query, user, user_id, data, answer):
 
 
 async def _cb_ctrl_stop(client, query, user, user_id, data, answer):
-    if not cfg.active_transfers.get(user_id):
-        return await answer("⚠️  No transfer is currently running.", alert=True)
+    transfer_running = bool(cfg.active_transfers.get(user_id))
+    monitor_running = bool(
+        cfg.active_monitors.get(user_id) or _task_running(user_id, "monitor"))
+    prescan_running = _task_running(user_id, "prescan")
+    if not (transfer_running or monitor_running or prescan_running):
+        return await answer("⚠️  No operation is currently running.", alert=True)
+
+    stopped = []
+    if monitor_running:
+        cfg.active_monitors.pop(user_id, None)
+        _cancel_task(user_id, "monitor")
+        stopped.append("monitor")
+    if prescan_running:
+        _cancel_task(user_id, "prescan")
+        stopped.append("pre-scan")
+
+    if not transfer_running:
+        return await answer(
+            f"⏹️  Stopping {' and '.join(stopped)}… status will update in chat",
+            alert=False)
+
     # Signal the loop to exit
     cfg.active_transfers.pop(user_id, None)
     cfg.paused_transfers.pop(user_id, None)
     prog = cfg.transfer_progress.get(user_id, {})
     _sent = prog.get("sent", 0)
-    await answer(f"⏹️  Stopped  ·  {_sent:,} files sent  ·  cursor saved", alert=False)
+    suffix = f" · also stopping {' and '.join(stopped)}" if stopped else ""
+    await answer(
+        f"⏹️  Stopped  ·  {_sent:,} files sent  ·  cursor saved{suffix}",
+        alert=False)
     # Build terminal card immediately; pop msg_id so the loop's finally block
     # doesn't attempt a second edit on the same message.
     msg_id = cfg.progress_msg_ids.pop(user_id, None)
@@ -772,16 +834,21 @@ async def _cb_monitor_menu(client, query, user, user_id, data, answer):
 async def _cb_monitor_start(client, query, user, user_id, data, answer):
     if not user.get("is_configured"):
         return await answer("⚠️ Run /setup first.", alert=True)
-    if cfg.active_monitors.get(user_id):
+    if cfg.active_monitors.get(user_id) or _task_running(user_id, "monitor"):
         return await answer("⚠️ Monitor already running.", alert=True)
     if cfg.active_transfers.get(user_id):
         return await answer("⚠️ Stop transfer first.", alert=True)
-    await answer("👁 Starting monitor…")
+    if _task_running(user_id, "prescan"):
+        return await answer("⚠️ Stop the pre-scan first.", alert=True)
     _track_task(_launch_monitor(user), user_id, "monitor")
+    await answer("👁 Starting monitor — live status will appear in chat.")
 
 
 async def _cb_monitor_stop(client, query, user, user_id, data, answer):
+    if not (cfg.active_monitors.get(user_id) or _task_running(user_id, "monitor")):
+        return await answer("⚠️ No monitor is running.", alert=True)
     cfg.active_monitors.pop(user_id, None)
+    _cancel_task(user_id, "monitor")
     await answer("🔴 Monitor stopping…")
 
 
@@ -790,8 +857,18 @@ async def _cb_prescan_channel(client, query, user, user_id, data, answer):
         return await answer("⚠️ Run /setup first.", alert=True)
     if cfg.active_transfers.get(user_id):
         return await answer("⚠️ Stop transfer first.", alert=True)
-    await answer("🔎 Starting pre-scan…")
+    if cfg.active_monitors.get(user_id) or _task_running(user_id, "monitor"):
+        return await answer("⚠️ Stop the live monitor first.", alert=True)
+    if _task_running(user_id, "prescan"):
+        return await answer("⚠️ Pre-scan already running. Check its status card.", alert=True)
     _track_task(_launch_prescan(user), user_id, "prescan")
+    await answer("🔎 Starting pre-scan — live progress will appear in chat.")
+
+
+async def _cb_prescan_stop(client, query, user, user_id, data, answer):
+    if not _cancel_task(user_id, "prescan"):
+        return await answer("⚠️ No pre-scan is running.", alert=True)
+    await answer("⏹️ Pre-scan stopping…")
 
 
 async def _cb_xfer_resume(client, query, user, user_id, data, answer):
@@ -884,6 +961,10 @@ async def _cb_admin_panel(client, query, user, user_id, data, answer):
 
 
 async def _cb_setup_confirm_reset(client, query, user, user_id, data, answer):
+    busy = _blocking_operation(user_id)
+    if busy:
+        return await answer(
+            f"⚠️ Stop {busy} before resetting configuration.", alert=True)
     await answer()
     await reset_user_config(user_id)
     fresh_user = await get_user(user_id)
@@ -927,6 +1008,7 @@ _CB_EXACT_HANDLERS = {
     "monitor_start":       _cb_monitor_start,
     "monitor_stop":        _cb_monitor_stop,
     "prescan_channel":     _cb_prescan_channel,
+    "prescan_stop":        _cb_prescan_stop,
     "admin_panel":         _cb_admin_panel,
     "setup_confirm_reset": _cb_setup_confirm_reset,
 }
@@ -993,6 +1075,30 @@ def _track_task(coro, user_id: int, kind: str) -> asyncio.Task:
     return task
 
 
+def _task_running(user_id: int, kind: str) -> bool:
+    task = cfg.active_tasks.get(f"{kind}:{user_id}")
+    return bool(task and not task.done())
+
+
+def _cancel_task(user_id: int, kind: str) -> bool:
+    task = cfg.active_tasks.get(f"{kind}:{user_id}")
+    if not task or task.done():
+        return False
+    task.cancel()
+    return True
+
+
+def _blocking_operation(user_id: int) -> str | None:
+    """Return the data operation that must finish before another can start."""
+    if cfg.active_transfers.get(user_id):
+        return "Transfer"
+    if _task_running(user_id, "prescan"):
+        return "Pre-scan"
+    if cfg.active_monitors.get(user_id) or _task_running(user_id, "monitor"):
+        return "Live monitor"
+    return None
+
+
 def _get_launch_lock(user_id: int) -> asyncio.Lock:
     """Per-user lock guarding the check-then-claim of active_transfers at
     transfer launch, so rapid double-taps on Start can't both pass the
@@ -1015,31 +1121,149 @@ async def _launch_transfer(user: dict) -> None:
     except Exception as e:
         cfg.logger.exception(f"[MAIN] Transfer launch error  user={user_id}  err={e}")
         cfg.active_transfers.pop(user_id, None)
+        progress = cfg.transfer_progress.get(user_id, {
+            "count": 0,
+            "total": 0,
+            "elapsed": 0.0,
+            "failed": 0,
+        })
+        progress["status"] = f"Could not start: {str(e)[:140]}"
+        msg_id = cfg.progress_msg_ids.pop(user_id, None)
+        if msg_id:
+            try:
+                await app.edit_message_text(
+                    user_id, msg_id,
+                    ui.build_progress_snapshot_card(
+                        progress, ui.TransferState.FAILED),
+                    reply_markup=ui.live_controls(ui.TransferState.FAILED))
+            except Exception:
+                pass
         cfg.transfer_progress.pop(user_id, None)
 
 
 async def _launch_monitor(user: dict) -> None:
     user_id = user["_id"]
     try:
+        if not cfg.monitor_msg_ids.get(user_id):
+            initial = {
+                "status": "Connecting to databases",
+                "sent": 0,
+                "failed": 0,
+                "elapsed": 0.0,
+            }
+            card = await app.send_message(
+                user_id,
+                ui.build_monitor_card(initial, "starting"),
+                reply_markup=ui.monitor_status_controls("starting", user_id),
+            )
+            cfg.monitor_msg_ids[user_id] = card.id
         worker  = await get_or_start_worker(user)
         source_db = await _get_user_db(user)
         state_db = await _get_state_db(user)
         await init_user_db(state_db)
         await run_monitor(worker, app, user, source_db, state_db)
+    except asyncio.CancelledError:
+        msg_id = cfg.monitor_msg_ids.get(user_id)
+        if msg_id and not cfg.monitor_progress.get(user_id):
+            try:
+                stopped = {
+                    "status": "Monitor stopped before startup completed",
+                    "sent": 0,
+                    "failed": 0,
+                    "elapsed": 0.0,
+                }
+                await app.edit_message_text(
+                    user_id, msg_id, ui.build_monitor_card(stopped, "stopped"),
+                    reply_markup=ui.monitor_status_controls("stopped", user_id))
+            except Exception:
+                pass
+        raise
     except Exception as e:
         cfg.logger.exception(f"[MAIN] Monitor launch error  user={user_id}  err={e}")
         cfg.active_monitors.pop(user_id, None)
+        msg_id = cfg.monitor_msg_ids.get(user_id)
+        if msg_id:
+            try:
+                failed = {
+                    "status": "Monitor could not start",
+                    "sent": 0,
+                    "failed": 0,
+                    "elapsed": 0.0,
+                    "error": str(e),
+                }
+                await app.edit_message_text(
+                    user_id, msg_id, ui.build_monitor_card(failed, "failed"),
+                    reply_markup=ui.monitor_status_controls("failed", user_id))
+            except Exception:
+                pass
+    finally:
+        cfg.monitor_msg_ids.pop(user_id, None)
+        cfg.monitor_progress.pop(user_id, None)
 
 
 async def _launch_prescan(user: dict) -> None:
     user_id = user["_id"]
     try:
+        # Publish a durable card before database setup so every potentially
+        # slow phase is visible to the Telegram user.
+        if not cfg.prescan_msg_ids.get(user_id):
+            initial = {
+                "phase": "Connecting to databases",
+                "step": 0,
+                "current": 0,
+                "total": 0,
+                "elapsed": 0.0,
+            }
+            card = await app.send_message(
+                user_id,
+                ui.build_prescan_card(initial),
+                reply_markup=ui.prescan_controls("running"),
+            )
+            cfg.prescan_msg_ids[user_id] = card.id
         source_db = await _get_user_db(user)
         state_db = await _get_state_db(user)
         await init_user_db(state_db)
         await run_prescan(app, user, source_db, state_db)
+    except asyncio.CancelledError:
+        # run_prescan owns the terminal edit once entered. This branch covers
+        # cancellation during the database-connection phase.
+        msg_id = cfg.prescan_msg_ids.get(user_id)
+        if msg_id and not cfg.prescan_progress.get(user_id):
+            try:
+                stopped = {
+                    "phase": "Stopped by user before scanning began",
+                    "step": 0,
+                    "current": 0,
+                    "total": 0,
+                    "elapsed": 0.0,
+                }
+                await app.edit_message_text(
+                    user_id, msg_id, ui.build_prescan_card(stopped, "stopped"),
+                    reply_markup=ui.prescan_controls("stopped"))
+            except Exception:
+                pass
+        raise
     except Exception as e:
         cfg.logger.exception(f"[MAIN] Prescan launch error  user={user_id}  err={e}")
+        msg_id = cfg.prescan_msg_ids.get(user_id)
+        if msg_id:
+            try:
+                failed = {
+                    "phase": "Could not start pre-scan",
+                    "step": 0,
+                    "current": 0,
+                    "total": 0,
+                    "elapsed": 0.0,
+                    "error": str(e),
+                }
+                await app.edit_message_text(
+                    user_id, msg_id, ui.build_prescan_card(failed, "failed"),
+                    reply_markup=ui.prescan_controls("failed"))
+            except Exception:
+                pass
+    finally:
+        cfg.prescan_msg_ids.pop(user_id, None)
+        cfg.prescan_progress.pop(user_id, None)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

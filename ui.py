@@ -19,6 +19,7 @@ class TransferState(str, Enum):
     PAUSED  = "paused"
     STOPPED = "stopped"
     DONE    = "done"
+    FAILED  = "failed"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -66,6 +67,7 @@ def build_progress_card(
         send_total: int | None = None,
         delivery_rate: float | None = None,
         eta_seconds: float | None = None,
+        status: str | None = None,
 ) -> str:
     """
     Build the live transfer progress card text.
@@ -76,17 +78,32 @@ def build_progress_card(
       "stopped"  — aborted by user
       "done"     — all files transferred
     """
+    headers = {
+        "running": "⏳ **TRANSFER PIPELINE STATUS**",
+        "paused":  "⏸️ **TRANSFER PAUSED**",
+        "stopped": "⏹️ **TRANSFER ABORTED BY USER**",
+        "done":    "✅ **TRANSFER COMPLETE**",
+        "failed":  "❌ **TRANSFER FAILED**",
+    }
+    header = headers.get(state, headers["running"])
+
     # Edge case: initial card before the DB has been queried
     if total == 0:
         bar = "░" * 22
-        return (
-            "⏳ **TRANSFER PIPELINE STATUS**\n"
-            f"`{'─' * 28}`\n"
-            "📦 Progress › `Initializing…`\n"
-            f"`{bar}`\n"
-            "⚡ Speed › `—`\n"
-            "📅 ETA › `Calculating…`"
-        )
+        lines = [
+            header,
+            f"`{'─' * 28}`",
+            "📦 Progress › `Initializing…`",
+            f"`{bar}`",
+            "⚡ Speed › `—`",
+        ]
+        if state in ("running", "paused"):
+            lines.append("📅 ETA › `Calculating…`")
+        else:
+            lines.append(f"⏱ Elapsed › `{_fmt_elapsed(elapsed)}`")
+        if status:
+            lines.append(f"🔧 Stage › `{status}`")
+        return "\n".join(lines)
 
     # Detailed transfer snapshots keep source scanning separate from actual
     # Telegram delivery. Duplicate skips can process thousands of records per
@@ -103,14 +120,6 @@ def build_progress_card(
         rate = count / elapsed if elapsed > 0 else 0.0
         eta_secs = (total - count) / rate if rate > 0 else 0.0
     bar      = _progress_bar(pct)
-
-    headers = {
-        "running": "⏳ **TRANSFER PIPELINE STATUS**",
-        "paused":  "⏸️ **TRANSFER PAUSED**",
-        "stopped": "⏹️ **TRANSFER ABORTED BY USER**",
-        "done":    "✅ **TRANSFER COMPLETE**",
-    }
-    header = headers.get(state, "⏳ **TRANSFER PIPELINE STATUS**")
 
     if detailed:
         lines = [
@@ -144,6 +153,9 @@ def build_progress_card(
     if failed:
         lines.append(f"⚠️ Failed › `{failed}`")
 
+    if status:
+        lines.append(f"🔧 Stage › `{status}`")
+
     return "\n".join(lines)
 
 
@@ -163,7 +175,77 @@ def build_progress_snapshot_card(
         send_total=progress.get("send_total"),
         delivery_rate=progress.get("delivery_rate"),
         eta_seconds=progress.get("eta_seconds"),
+        status=progress.get("status"),
     )
+
+
+def build_prescan_card(progress: dict, state: str = "running") -> str:
+    """Render the live three-stage duplicate pre-scan status card."""
+    headers = {
+        "running": "🔎 **PRE-SCAN IN PROGRESS**",
+        "stopped": "⏹️ **PRE-SCAN STOPPED**",
+        "done": "✅ **PRE-SCAN COMPLETE**",
+        "failed": "❌ **PRE-SCAN FAILED**",
+    }
+    current = max(0, int(progress.get("current", 0) or 0))
+    total = max(0, int(progress.get("total", 0) or 0))
+    pct = min(100.0, current / total * 100) if total else 0.0
+    phase = progress.get("phase", "Preparing…")
+    step = int(progress.get("step", 0) or 0)
+    elapsed = float(progress.get("elapsed", 0.0) or 0.0)
+    lines = [
+        headers.get(state, headers["running"]),
+        f"`{'─' * 28}`",
+        f"🔧 Stage › `{phase}`",
+    ]
+    if step:
+        lines.append(f"🧭 Step › `{step} of 3`")
+    if total:
+        lines.extend([
+            f"📊 Progress › `{current:,}` / `{total:,}` · `{pct:.1f}%`",
+            f"`{_progress_bar(pct)}`",
+        ])
+    elif current:
+        lines.append(f"📊 Processed › `{current:,}`")
+
+    if progress.get("messages") is not None:
+        lines.append(f"💬 Channel messages › `{int(progress['messages']):,}`")
+    if progress.get("keys") is not None:
+        lines.append(f"🔑 Duplicate keys › `{int(progress['keys']):,}`")
+    if progress.get("checked") is not None:
+        lines.append(f"📦 MongoDB checked › `{int(progress['checked']):,}`")
+    if progress.get("skippable") is not None:
+        lines.append(f"⏭ Will skip › `{int(progress['skippable']):,}`")
+    if progress.get("fresh") is not None:
+        lines.append(f"🆕 Will transfer › `{int(progress['fresh']):,}`")
+    if progress.get("error"):
+        lines.append(f"⚠️ Reason › `{str(progress['error'])[:180]}`")
+    lines.append(f"⏱ Elapsed › `{_fmt_elapsed(elapsed)}`")
+    if state == "running" and step == 1:
+        lines.append("ℹ️ Telegram may briefly pause the scan for rate limits.")
+    return "\n".join(lines)
+
+
+def build_monitor_card(progress: dict, state: str = "running") -> str:
+    """Render a persistent live-monitor status card."""
+    headers = {
+        "running": "👁 **LIVE MONITOR ACTIVE**",
+        "starting": "⏳ **LIVE MONITOR STARTING**",
+        "waiting": "⏳ **LIVE MONITOR WAITING**",
+        "stopped": "⏹️ **LIVE MONITOR STOPPED**",
+        "failed": "❌ **LIVE MONITOR FAILED**",
+    }
+    lines = [
+        headers.get(state, headers["running"]),
+        f"`{'─' * 28}`",
+        f"🔧 Status › `{progress.get('status', 'Preparing…')}`",
+        f"✅ Forwarded › `{int(progress.get('sent', 0) or 0):,}`",
+        f"❌ Failed › `{int(progress.get('failed', 0) or 0):,}`",
+        f"⏱ Running › `{_fmt_elapsed(float(progress.get('elapsed', 0.0) or 0.0))}`",
+    ]
+    if progress.get("error"):
+        lines.append(f"⚠️ Reason › `{str(progress['error'])[:180]}`")
+    return "\n".join(lines)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -171,25 +253,45 @@ def build_progress_snapshot_card(
 # ══════════════════════════════════════════════════════════════════════════════
 
 def home_card_text(stats: dict, user_id: int) -> str:
+    scan_task = cfg.active_tasks.get(f"prescan:{user_id}")
+    scan_state = "Running" if scan_task and not scan_task.done() else "Idle"
+    monitor_task = cfg.active_tasks.get(f"monitor:{user_id}")
+    monitor_state = (
+        "Running"
+        if cfg.active_monitors.get(user_id)
+        or (monitor_task and not monitor_task.done())
+        else "Idle"
+    )
     return (
         f"⚡ **C7 MongoDB Transfer Bot V2.0**\n`{cfg.SEP}`\n"
         f"📦 Total files › `{stats['total_files']:,}`\n"
         f"✅ Sent › `{stats['sent_files']:,}`\n"
         f"⏳ Remaining › `{stats['remaining']:,}`\n"
         f"🔄 Transfer › `{'Paused' if cfg.paused_transfers.get(user_id) else 'Running' if cfg.active_transfers.get(user_id) else 'Idle'}`\n"
-        f"👁 Monitor › `{'Running' if cfg.active_monitors.get(user_id) else 'Idle'}`\n"
+        f"👁 Monitor › `{monitor_state}`\n"
+        f"🔎 Pre-Scan › `{scan_state}`\n"
         f"`{cfg.SEP}`"
     )
 
 
 def stats_card_text(stats: dict, user_id: int) -> str:
+    scan_task = cfg.active_tasks.get(f"prescan:{user_id}")
+    scan_state = "Running" if scan_task and not scan_task.done() else "Idle"
+    monitor_task = cfg.active_tasks.get(f"monitor:{user_id}")
+    monitor_state = (
+        "Running"
+        if cfg.active_monitors.get(user_id)
+        or (monitor_task and not monitor_task.done())
+        else "Idle"
+    )
     return (
         f"📊 **Transfer Statistics**\n`{cfg.SEP}`\n"
         f"📦 Total files › `{stats['total_files']:,}`\n"
         f"✅ Sent › `{stats['sent_files']:,}`\n"
         f"⏳ Remaining › `{stats['remaining']:,}`\n"
         f"🔄 Transfer › `{'Paused' if cfg.paused_transfers.get(user_id) else 'Running' if cfg.active_transfers.get(user_id) else 'Idle'}`\n"
-        f"👁 Monitor › `{'Running' if cfg.active_monitors.get(user_id) else 'Idle'}`\n"
+        f"👁 Monitor › `{monitor_state}`\n"
+        f"🔎 Pre-Scan › `{scan_state}`\n"
         f"📍 Last ID › `{stats['last_id'] or 'None'}`"
     )
 
@@ -244,7 +346,7 @@ def live_controls(state: TransferState | str) -> InlineKeyboardMarkup:
             InlineKeyboardButton("⏹️ Stop",      callback_data="ctrl_stop"),
             InlineKeyboardButton("⚙️ Settings",  callback_data="settings_menu"),
         ]])
-    if state in ("stopped", "done"):
+    if state in ("stopped", "done", "failed"):
         return InlineKeyboardMarkup([[
             InlineKeyboardButton("🏠 Home",       callback_data="go_home"),
             InlineKeyboardButton("⚙️ Settings",   callback_data="settings_menu"),
@@ -262,13 +364,38 @@ def back_button(target: str = "settings_menu") -> InlineKeyboardMarkup:
 
 
 def monitor_menu(user_id: int) -> InlineKeyboardMarkup:
-    active = cfg.active_monitors.get(user_id, False)
+    task = cfg.active_tasks.get(f"monitor:{user_id}")
+    active = cfg.active_monitors.get(user_id, False) or bool(task and not task.done())
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(
             "🔴 Stop Monitor" if active else "🟢 Start Monitor",
             callback_data="monitor_stop" if active else "monitor_start")],
         [InlineKeyboardButton("🏠 Home", callback_data="go_home")],
     ])
+
+
+def monitor_status_controls(state: str, user_id: int) -> InlineKeyboardMarkup:
+    if state in ("starting", "running", "waiting"):
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔴 Stop Monitor", callback_data="monitor_stop")],
+            [InlineKeyboardButton("🏠 Home", callback_data="go_home")],
+        ])
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🟢 Start Again", callback_data="monitor_start"),
+        InlineKeyboardButton("🏠 Home", callback_data="go_home"),
+    ]])
+
+
+def prescan_controls(state: str = "running") -> InlineKeyboardMarkup:
+    if state == "running":
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("⏹️ Stop Pre-Scan", callback_data="prescan_stop")],
+            [InlineKeyboardButton("🏠 Home", callback_data="go_home")],
+        ])
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("🏠 Home", callback_data="go_home"),
+        InlineKeyboardButton("🔎 Run Again", callback_data="prescan_channel"),
+    ]])
 
 
 def db_list_menu(db_names: list[str]) -> InlineKeyboardMarkup:

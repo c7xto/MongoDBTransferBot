@@ -130,8 +130,16 @@ The worker bot must be an administrator in the target channel before starting.
 5. Run `/monitor` after the full transfer finishes
 
 `/prescan` prevents files already present in the channel from being sent again.
+It publishes a live three-step Telegram status card with progress, elapsed time,
+completion/failure details, and a Stop button.
 
 `/monitor` watches for new source records and copies them as they are added.
+Its persistent status card shows startup checks, forwarded/failed counts,
+rate-limit waits, reconnects, and the final stopped or failed state.
+
+Transfer, Pre-Scan, and Live Monitor are mutually exclusive so they cannot
+race over the same delivery ledger. Emergency Stop stops whichever operation
+is active, and destructive wipe/reset actions are blocked while work is running.
 
 ---
 
@@ -146,6 +154,7 @@ The worker bot must be an administrator in the target channel before starting.
 | `/monitor` | Watch for newly added files |
 | `/stopmonitor` | Stop watching for new files |
 | `/prescan` | Check files already in the target channel |
+| `/stopprescan` | Stop an active pre-scan safely |
 | `/stats` | Show transfer totals and progress |
 | `/config` | Show saved settings with secrets hidden |
 | `/wipe` | Clear saved progress and duplicate records |

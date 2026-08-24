@@ -199,6 +199,14 @@ paused_transfers:   dict[int, bool]   = {}
 # True while a monitor is running for that user_id
 active_monitors:    dict[int, bool]   = {}
 
+# Live Telegram status cards for long-running non-transfer operations.
+# Keeping these separate from transfer_progress prevents one workflow from
+# overwriting another workflow's card or snapshot.
+prescan_msg_ids:     dict[int, int]    = {}
+prescan_progress:    dict[int, dict]   = {}
+monitor_msg_ids:     dict[int, int]    = {}
+monitor_progress:    dict[int, dict]   = {}
+
 # Future objects used during /prescan interactive auth, keyed by user_id
 scan_auth_futures:  dict[int, object] = {}
 

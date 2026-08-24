@@ -198,7 +198,7 @@ async def _edit_card(
     """
     Edit the live progress card for this user.
     Silently swallows all errors — UI failures must never kill the transfer.
-    Pops the msg_id from cfg for terminal states (stopped / done) so the
+    Pops the msg_id from cfg for terminal states (stopped / done / failed) so the
     transfer loop never attempts a second edit on a closed card.
     """
     msg_id = cfg.progress_msg_ids.get(user_id)
@@ -214,7 +214,7 @@ async def _edit_card(
             reply_markup=ui.live_controls(state))
     except Exception:
         pass
-    if state in ("stopped", "done"):
+    if state in ("stopped", "done", "failed"):
         cfg.progress_msg_ids.pop(user_id, None)
 
 
@@ -303,6 +303,7 @@ async def run_transfer(
     send_total = 0
     delivery_rate = 0.0
     eta_seconds = 0.0
+    status_text = "Preparing worker and target channel"
     rate_samples: deque[tuple[float, int]] = deque()
     if state_db is None:
         raise RuntimeError("Host-owned state database is required")
@@ -336,6 +337,7 @@ async def run_transfer(
             "send_total": send_total,
             "delivery_rate": delivery_rate,
             "eta_seconds": eta_seconds,
+            "status": status_text,
         }
         cfg.transfer_progress[user_id] = snapshot
         return snapshot
@@ -345,12 +347,19 @@ async def run_transfer(
     try:
         # ── Pre-flight: resolve target channel ────────────────────────────────
         L.info(f"[XFER] Running pre-flight checks  user={user_id}")
+        await _edit_card(admin_app, admin_id, user_id,
+                         count, total, 0.0, 0, ui.TransferState.RUNNING,
+                         _snapshot())
         target = str(user_cfg["target"])
         target_id = await target_resolve.resolve_target_chat_id(worker, target)
 
         test = await worker.send_message(target_id, "🔄 C7 › Connection Test")
         await test.delete()
         L.info(f"[XFER] Pre-flight passed  target={target_id}  user={user_id}")
+        status_text = "Loading collection and saved progress"
+        await _edit_card(admin_app, admin_id, user_id,
+                         count, total, time.time() - transfer_start, 0,
+                         ui.TransferState.RUNNING, _snapshot())
 
         # ── Connect to user's source data collection ──────────────────────────
         # source_db is already connected to db_name — reuse its client rather than
@@ -386,6 +395,7 @@ async def run_transfer(
         L.info(f"[XFER] Collection loaded  total={total:,}  "
                f"already_sent={sent_before:,}  mode={cursor_mode}  "
                f"resumed_from={last_id if cursor_mode == 'keyset' else scan_offset}  user={user_id}")
+        status_text = "Checking duplicates and delivering new files"
 
         # Push initial snapshot so the card shows real totals immediately
         elapsed_now = time.time() - transfer_start
@@ -429,9 +439,17 @@ async def run_transfer(
                     L.warning(
                         f"[CONN] Connection lost (attempt {fetch_attempt}/{_CONN_MAX_RETRIES}) — "
                         f"pausing {_CONN_RETRY_WAIT}s to reconnect…  err={conn_err}  user={user_id}")
+                    status_text = (
+                        f"MongoDB disconnected — retry {fetch_attempt}/{_CONN_MAX_RETRIES} "
+                        f"in {_CONN_RETRY_WAIT}s")
+                    await _edit_card(
+                        admin_app, admin_id, user_id, count, total,
+                        time.time() - transfer_start, len(failed_files),
+                        ui.TransferState.RUNNING, _snapshot())
                     await asyncio.sleep(_CONN_RETRY_WAIT)
                     col = source_db[col_name]  # Motor reconnects automatically on next use
                     await _ensure_worker_connected(worker, user_id)
+                    status_text = "Checking duplicates and delivering new files"
 
             if not keep or not batch:
                 break
@@ -535,7 +553,13 @@ async def run_transfer(
                         speed = current_speed
                         L.warning(f"[XFER] FloodWait {fw.value}s — speed bumped to "
                                    f"{current_speed}s  user={user_id}")
+                        status_text = f"Telegram rate limit — retrying in {fw.value + 5}s"
+                        await _edit_card(
+                            admin_app, admin_id, user_id, count, total,
+                            time.time() - transfer_start, len(failed_files),
+                            ui.TransferState.RUNNING, _snapshot())
                         await asyncio.sleep(fw.value + 5)
+                        status_text = "Checking duplicates and delivering new files"
 
                         first_fid = get_file_id(chunk[0])
                         already_sent = bool(await filter_already_sent(state_db, [first_fid]))
@@ -671,7 +695,13 @@ async def run_transfer(
                             f"💤 [STEALTH] Taking a {break_secs}s micro-cooling break "
                             f"to protect account health…  delivery_chunks={delivery_chunks}  "
                             f"user={user_id}")
+                        status_text = f"Account-safety cooling break — {break_secs}s"
+                        await _edit_card(
+                            admin_app, admin_id, user_id, count, total,
+                            time.time() - transfer_start, len(failed_files),
+                            ui.TransferState.RUNNING, _snapshot())
                         await asyncio.sleep(break_secs)
+                        status_text = "Checking duplicates and delivering new files"
 
         # ── Save final cursor ────────────────────────────────────────────────
         await save_state(
@@ -710,6 +740,11 @@ async def run_transfer(
 
     except Exception as e:
         L.exception(f"[XFER] Worker error  err={e}  user={user_id}")
+        status_text = f"Stopped by error: {str(e)[:140]}"
+        await _edit_card(
+            admin_app, admin_id, user_id, count, total,
+            time.time() - transfer_start, len(failed_files),
+            ui.TransferState.FAILED, _snapshot())
 
     finally:
         cfg.active_transfers.pop(user_id, None)

@@ -5,6 +5,7 @@ Multi-user mode: accepts user_cfg dict and a Motor db handle.
 from __future__ import annotations
 
 import asyncio
+import time
 
 from pyrogram import Client
 from pyrogram.errors import SessionPasswordNeeded
@@ -12,6 +13,7 @@ from pyrogram.errors import SessionPasswordNeeded
 import config as cfg
 import crypto
 import target_resolve
+import ui
 from source_docs import SOURCE_PROJECTION, get_file_id, get_match_keys
 from user_db import (
     count_sent_ids,
@@ -22,6 +24,34 @@ from user_db import (
 )
 
 L = cfg.logger
+_UI_EDIT_INTERVAL = 10.0
+
+
+async def _edit_status(admin_app: Client, user_id: int, progress: dict,
+                       state: str = "running") -> None:
+    """Best-effort edit of the persistent Telegram pre-scan card."""
+    cfg.prescan_progress[user_id] = dict(progress)
+    msg_id = cfg.prescan_msg_ids.get(user_id)
+    if not msg_id:
+        try:
+            msg = await admin_app.send_message(
+                user_id,
+                ui.build_prescan_card(progress, state),
+                reply_markup=ui.prescan_controls(state),
+            )
+            cfg.prescan_msg_ids[user_id] = msg.id
+        except Exception:
+            pass
+        return
+    try:
+        await admin_app.edit_message_text(
+            user_id,
+            msg_id,
+            ui.build_prescan_card(progress, state),
+            reply_markup=ui.prescan_controls(state),
+        )
+    except Exception:
+        pass
 
 
 async def run_prescan(
@@ -41,6 +71,35 @@ async def run_prescan(
         raise RuntimeError("Host-owned state database is required")
 
     L.info(f"[SCAN] Pre-scan started  user={user_id}")
+    started_at = time.monotonic()
+    progress = {
+        "phase": "Preparing database and Telegram session",
+        "step": 0,
+        "current": 0,
+        "total": 0,
+        "elapsed": 0.0,
+    }
+
+    def _progress(**updates) -> dict:
+        progress.update(updates)
+        progress["elapsed"] = time.monotonic() - started_at
+        return dict(progress)
+
+    # mdb.py normally creates this card before scheduling the task so even
+    # database connection setup is visible. This fallback also covers direct
+    # calls and keeps the operation observable if that initial send failed.
+    if not cfg.prescan_msg_ids.get(user_id):
+        try:
+            msg = await admin_app.send_message(
+                admin_id,
+                ui.build_prescan_card(_progress()),
+                reply_markup=ui.prescan_controls("running"),
+            )
+            cfg.prescan_msg_ids[user_id] = msg.id
+        except Exception:
+            pass
+    else:
+        await _edit_status(admin_app, user_id, _progress())
 
     stored_session = (user_cfg.get("userbot_session") or "").strip()
     api_id   = user_cfg["api_id"]
@@ -154,13 +213,43 @@ async def run_prescan(
         ) as worker:
 
             target = str(user_cfg["target"])
+            await _edit_status(admin_app, user_id, _progress(
+                phase="Resolving target channel",
+                step=1,
+            ))
             target_id = await target_resolve.resolve_target_chat_id(
                 worker, target, user_id=user_id, raise_friendly_error=True)
 
             L.info(f"[SCAN] Step 1/3 — scanning channel  target={target_id}  user={user_id}")
 
+            channel_total = 0
+            await _edit_status(admin_app, user_id, _progress(
+                phase="Scanning target channel for existing files",
+                step=1,
+                current=0,
+                total=0,
+                messages=0,
+                keys=0,
+            ))
+            try:
+                counter = getattr(worker, "get_chat_history_count", None)
+                if counter:
+                    channel_total = int(await counter(target_id))
+            except Exception:
+                # A total improves the bar but is not required for a safe scan.
+                channel_total = 0
+
             channel_keys: set = set()
             msg_count = 0
+            last_ui_edit = 0.0
+            await _edit_status(admin_app, user_id, _progress(
+                phase="Scanning target channel for existing files",
+                step=1,
+                current=0,
+                total=channel_total,
+                messages=0,
+                keys=0,
+            ))
 
             async for message in worker.get_chat_history(target_id):
                 media = (message.document or message.video
@@ -177,6 +266,14 @@ async def run_prescan(
                 if msg_count % 500 == 0:
                     L.info(f"[SCAN] Step 1/3 progress  messages={msg_count:,}  "
                            f"keys={len(channel_keys):,}  user={user_id}")
+                    now = time.monotonic()
+                    if now - last_ui_edit >= _UI_EDIT_INTERVAL:
+                        await _edit_status(admin_app, user_id, _progress(
+                            current=msg_count,
+                            messages=msg_count,
+                            keys=len(channel_keys),
+                        ))
+                        last_ui_edit = now
 
             await index_channel_key(state_db, list(channel_keys))
             total_indexed = await get_channel_index_count(state_db)
@@ -189,6 +286,17 @@ async def run_prescan(
 
             L.info(f"[SCAN] Step 2/3 — cross-referencing MongoDB  "
                    f"total_docs={total_docs:,}  user={user_id}")
+
+            await _edit_status(admin_app, user_id, _progress(
+                phase="Cross-referencing MongoDB with the channel index",
+                step=2,
+                current=0,
+                total=total_docs,
+                messages=msg_count,
+                keys=total_indexed,
+                checked=0,
+            ))
+            last_ui_edit = 0.0
 
             matched: list = []
             checked = 0
@@ -225,6 +333,13 @@ async def run_prescan(
                 if checked % 2000 == 0:
                     L.info(f"[SCAN] Step 2/3 progress  checked={checked:,}/{total_docs:,}  "
                            f"user={user_id}")
+                    now = time.monotonic()
+                    if now - last_ui_edit >= _UI_EDIT_INTERVAL:
+                        await _edit_status(admin_app, user_id, _progress(
+                            current=checked,
+                            checked=checked,
+                        ))
+                        last_ui_edit = now
 
             await _flush_buffer(doc_buffer)
             if matched:
@@ -237,14 +352,22 @@ async def run_prescan(
             L.info(f"[SCAN] Pre-scan complete  skip={skippable:,}  "
                    f"fresh={fresh:,}  user={user_id}")
 
-            await admin_app.send_message(
-                admin_id,
-                f"✅ **Pre-Scan Complete!**\n`{cfg.SEP}`\n"
-                f"📡 Channel messages › `{msg_count:,}`\n"
-                f"📦 MongoDB docs › `{checked:,}`\n"
-                f"⏭  Will skip › `{skippable:,}`\n"
-                f"🆕 Will transfer › `{fresh:,}`\n`{cfg.SEP}`\n"
-                f"Duplicates locked out — ready to launch.")
+            await _edit_status(admin_app, user_id, _progress(
+                phase="Duplicates indexed — ready to launch",
+                step=3,
+                current=checked,
+                total=total_docs,
+                checked=checked,
+                skippable=skippable,
+                fresh=fresh,
+            ), state="done")
+
+    except asyncio.CancelledError:
+        L.info(f"[SCAN] Pre-scan stopped by user  user={user_id}")
+        await _edit_status(admin_app, user_id, _progress(
+            phase="Stopped by user — no transfer was started",
+        ), state="stopped")
+        raise
 
     except Exception as e:
         err = str(e)
@@ -266,11 +389,11 @@ async def run_prescan(
         else:
             L.exception(f"[SCAN] Pre-scan error  user={user_id}")
 
-        try:
-            await admin_app.send_message(
-                admin_id,
-                f"❌ **Pre-Scan Failed**\n`{cfg.SEP2}`\n{err}")
-        except Exception:
-            pass
+        await _edit_status(admin_app, user_id, _progress(
+            phase="Pre-scan could not continue",
+            error=err,
+        ), state="failed")
     finally:
         cfg.scan_auth_futures.pop(user_id, None)
+        cfg.prescan_msg_ids.pop(user_id, None)
+        cfg.prescan_progress.pop(user_id, None)
