@@ -221,4 +221,10 @@ The saved Telegram file ID may belong to a different bot or may no longer be usa
 
 ---
 
+## 📜 License
+
+This project is available under the [MIT License](LICENSE).
+
+---
+
 Made for simple and reliable Telegram file transfers.
