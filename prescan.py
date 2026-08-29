@@ -16,10 +16,8 @@ import target_resolve
 import ui
 from source_docs import SOURCE_PROJECTION, get_file_id, get_match_keys
 from user_db import (
+    clear_channel_index,
     count_sent_ids,
-    filter_in_channel_index,
-    get_channel_index_count,
-    index_channel_key,
     mark_as_sent,
 )
 
@@ -275,10 +273,13 @@ async def run_prescan(
                         ))
                         last_ui_edit = now
 
-            await index_channel_key(state_db, list(channel_keys))
-            total_indexed = await get_channel_index_count(state_db)
+            # ``channel_keys`` is already resident in memory. Persisting the
+            # same keys in MongoDB used hundreds of megabytes on Atlas Free
+            # and provided no benefit after this scan, because matched source
+            # IDs are copied into the durable c7_sent_ids ledger below.
+            total_indexed = len(channel_keys)
             L.info(f"[SCAN] Step 1/3 done  messages={msg_count:,}  "
-                   f"keys_indexed={total_indexed:,}  user={user_id}")
+                   f"keys_found={total_indexed:,}  user={user_id}")
 
             # ── Step 2: Cross-reference with MongoDB ───────────────────────────
             col = source_db[user_cfg["col_name"]]
@@ -301,22 +302,19 @@ async def run_prescan(
             matched: list = []
             checked = 0
 
-            # Cross-reference in batches of 1000: one $in query per batch
-            # against c7_scan_index instead of one is_in_channel_index()
-            # round-trip per document — the doc count here is exactly the
-            # kind of "millions of files" scale this needs to survive.
+            # Cross-reference in batches of 1000 against the in-memory set.
+            # The old implementation duplicated every key into MongoDB and
+            # exhausted the 512 MB Atlas Free quota.
             CHECK_BATCH = 1000
             doc_buffer: list = []
 
             async def _flush_buffer(buf: list) -> None:
                 if not buf:
                     return
-                keys_by_file = {
-                    get_file_id(d): get_match_keys(d)
-                    for d in buf if get_file_id(d)
-                }
-                hits = await filter_in_channel_index(state_db, keys_by_file)
-                matched.extend(hits)
+                for doc in buf:
+                    file_id = get_file_id(doc)
+                    if file_id and channel_keys.intersection(get_match_keys(doc)):
+                        matched.append(file_id)
 
             async for doc in col.find({}, SOURCE_PROJECTION).sort("_id", 1):
                 doc_buffer.append(doc)
@@ -361,6 +359,17 @@ async def run_prescan(
                 skippable=skippable,
                 fresh=fresh,
             ), state="done")
+
+            # Remove any scratch collection left by an older deployment.
+            # Cleanup is best-effort: the durable duplicate ledger remains
+            # valid even if Atlas temporarily refuses this drop operation.
+            try:
+                await clear_channel_index(state_db)
+                L.info(f"[DB] Released temporary pre-scan index  user={user_id}")
+            except Exception as cleanup_error:
+                L.warning(
+                    f"[DB] Could not release temporary pre-scan index  "
+                    f"user={user_id}  err={cleanup_error}")
 
     except asyncio.CancelledError:
         L.info(f"[SCAN] Pre-scan stopped by user  user={user_id}")

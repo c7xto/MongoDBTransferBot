@@ -1121,23 +1121,33 @@ async def _launch_transfer(user: dict) -> None:
     except Exception as e:
         cfg.logger.exception(f"[MAIN] Transfer launch error  user={user_id}  err={e}")
         cfg.active_transfers.pop(user_id, None)
+        error_text = str(e)
+        if "over your space quota" in error_text.lower() or "code': 8000" in error_text:
+            status = (
+                "MongoDB storage is full. No progress was lost. "
+                "Free Atlas space, then press Continue again."
+            )
+        else:
+            status = f"Could not start: {error_text[:140]}"
         progress = cfg.transfer_progress.get(user_id, {
             "count": 0,
             "total": 0,
             "elapsed": 0.0,
             "failed": 0,
         })
-        progress["status"] = f"Could not start: {str(e)[:140]}"
+        progress["status"] = status
         msg_id = cfg.progress_msg_ids.pop(user_id, None)
-        if msg_id:
-            try:
+        try:
+            card_text = ui.build_progress_snapshot_card(
+                progress, ui.TransferState.FAILED)
+            controls = ui.live_controls(ui.TransferState.FAILED)
+            if msg_id:
                 await app.edit_message_text(
-                    user_id, msg_id,
-                    ui.build_progress_snapshot_card(
-                        progress, ui.TransferState.FAILED),
-                    reply_markup=ui.live_controls(ui.TransferState.FAILED))
-            except Exception:
-                pass
+                    user_id, msg_id, card_text, reply_markup=controls)
+            else:
+                await app.send_message(user_id, card_text, reply_markup=controls)
+        except Exception:
+            pass
         cfg.transfer_progress.pop(user_id, None)
 
 
@@ -1383,6 +1393,34 @@ async def _boot_auto_resume() -> None:
         cfg.logger.info("[BOOT] No unfinished transfers detected — clean boot")
 
 
+async def _cleanup_legacy_runtime_storage() -> None:
+    """Remove disposable pre-scan collections left by older deployments.
+
+    This runs before resume prompts, when no user operation can be active.
+    Durable transfer cursors and ``c7_sent_ids`` are deliberately untouched.
+    """
+    try:
+        users = await get_all_configured_users()
+    except Exception as e:
+        cfg.logger.warning(f"[DB] Runtime cleanup could not list users  err={e}")
+        return
+
+    cleaned = 0
+    for user in users:
+        user_id = user["_id"]
+        try:
+            state_db = await _get_state_db(user)
+            await clear_channel_index(state_db)
+            cleaned += 1
+        except Exception as e:
+            cfg.logger.warning(
+                f"[DB] Runtime cleanup skipped  user={user_id}  err={e}")
+    if cleaned:
+        cfg.logger.info(
+            f"[DB] Runtime cleanup checked {cleaned} user database(s); "
+            "durable cursors and sent-ID ledgers preserved")
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1393,6 +1431,7 @@ async def _startup() -> None:
                 cfg.SYSTEM_TASK_MOTOR_EVICTION, "motor-eviction")
     cfg.logger.info("[SYSTEM] Started Motor client idle-eviction loop")
     await start_health_server()
+    await _cleanup_legacy_runtime_storage()
 
     try:
         async with aiohttp.ClientSession() as _sess:

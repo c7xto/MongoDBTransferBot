@@ -143,9 +143,7 @@ async def test_prescan_edits_a_live_card_through_start_and_completion(monkeypatc
     monkeypatch.setattr(
         prescan.target_resolve, "resolve_target_chat_id",
         _async_value(-1001))
-    monkeypatch.setattr(prescan, "index_channel_key", _async_value(None))
-    monkeypatch.setattr(prescan, "get_channel_index_count", _async_value(4))
-    monkeypatch.setattr(prescan, "filter_in_channel_index", _async_value(set()))
+    monkeypatch.setattr(prescan, "clear_channel_index", _async_value(None))
     monkeypatch.setattr(prescan, "mark_as_sent", _async_value(True))
     monkeypatch.setattr(prescan, "count_sent_ids", _async_value(0))
 

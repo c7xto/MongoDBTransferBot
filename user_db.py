@@ -28,7 +28,6 @@ def _col_state(db):         return db["c7_state"]
 async def init_user_db(db) -> None:
     """Create required indexes in the user's database."""
     await _col_sent_ids(db).create_index("file_id", unique=True)
-    await _col_scan_index(db).create_index("match_key", unique=True)
 
 
 # ── State persistence ─────────────────────────────────────────────────────────
@@ -169,7 +168,14 @@ async def filter_in_channel_index(db, keys_by_file: dict) -> set:
 
 
 async def clear_channel_index(db) -> None:
-    await _col_scan_index(db).delete_many({})
+    """Drop the disposable pre-scan index, including its MongoDB indexes.
+
+    Successful pre-scans copy every matched source ``file_id`` into the
+    durable ``c7_sent_ids`` ledger. The channel-key index is therefore only
+    scratch space and must never consume quota between scans/transfers.
+    ``drop()`` also releases the collection's index allocation.
+    """
+    await _col_scan_index(db).drop()
 
 
 async def get_channel_index_count(db) -> int:

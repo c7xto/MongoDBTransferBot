@@ -25,12 +25,12 @@ from pyrogram.types import (
 import config as cfg
 import target_resolve
 import ui
-from source_docs import SOURCE_PROJECTION, get_file_id, get_match_keys
+from source_docs import SOURCE_PROJECTION, get_file_id
 from user_db import (
+    clear_channel_index,
     clear_state,
     count_sent_ids,
     filter_already_sent,
-    filter_in_channel_index,
     load_state,
     mark_as_sent,
     save_state,
@@ -480,22 +480,6 @@ async def run_transfer(
             batch_file_ids = [get_file_id(doc) for doc in valid_batch]
             already_sent_set = await filter_already_sent(state_db, batch_file_ids)
 
-            keys_by_file = {}
-            for doc in valid_batch:
-                fid = get_file_id(doc)
-                if fid in already_sent_set:
-                    continue
-                keys_by_file[fid] = get_match_keys(doc)
-
-            in_index_set = await filter_in_channel_index(state_db, keys_by_file)
-            if in_index_set:
-                await mark_as_sent(state_db, list(in_index_set))
-                newly_indexed = in_index_set - already_sent_set
-                send_total = max(
-                    sent_files + len(failed_files),
-                    send_total - len(newly_indexed),
-                )
-
             for i in range(0, len(valid_batch), ALBUM):
                 chunk = valid_batch[i:i + ALBUM]
 
@@ -522,7 +506,7 @@ async def run_transfer(
                 skipped_ids = []
                 for doc in chunk:
                     fid = get_file_id(doc)
-                    if fid in already_sent_set or fid in in_index_set:
+                    if fid in already_sent_set:
                         skipped_ids.append(fid)
                         continue
                     fresh.append(doc)
@@ -716,6 +700,12 @@ async def run_transfer(
         # ── Transfer completed naturally ──────────────────────────────────────
         if cfg.active_transfers.get(user_id) and count >= total:
             await clear_state(state_db)
+            try:
+                await clear_channel_index(state_db)
+            except Exception as cleanup_error:
+                L.warning(
+                    f"[DB] Could not release temporary pre-scan index after transfer  "
+                    f"user={user_id}  err={cleanup_error}")
             L.info(f"[XFER] Transfer complete  sent={sent_files:,}  skipped={skipped_files:,}  "
                    f"failed={len(failed_files)}  elapsed={elapsed_final:.0f}s  user={user_id}")
             await _edit_card(admin_app, admin_id, user_id,
